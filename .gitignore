@@ -1,0 +1,16 @@
+# Python 缓存
+__pycache__/
+*.py[cod]
+
+# 虚拟环境（绝对不上传！）
+.venv/
+venv/
+
+# IDE 配置
+.idea/
+
+# 敏感密码
+.env
+
+# 本地数据库数据
+pgdata/

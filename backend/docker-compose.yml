@@ -1,0 +1,20 @@
+services:
+  postgres:
+    image: postgres:16
+    ports:
+      - "5432:5432"
+    environment:
+      - POSTGRES_USER=cloud
+      - POSTGRES_PASSWORD=cloud
+      - POSTGRES_DB=microduck
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  emqx:
+    image: emqx/emqx:5.8.3
+    ports:
+      - "1883:1883"
+      - "18083:18083"
+
+volumes:
+  pgdata:

@@ -1,0 +1,1 @@
+DATABASE_URL = "postgresql://cloud:cloud@localhost:5432/microduck"
