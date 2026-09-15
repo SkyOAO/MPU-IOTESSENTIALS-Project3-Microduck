@@ -19,7 +19,7 @@ class Command(Base):
     #创建时间
     created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
     #完成时间
-    completed_at = Column(DateTime, nullable=True)
+    completed_at = Column(DateTime(timezone=True), nullable=True)
 
 
 

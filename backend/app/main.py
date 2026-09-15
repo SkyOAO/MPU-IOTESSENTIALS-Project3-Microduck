@@ -1,9 +1,11 @@
-import uuid
-import aiomqtt
 import json
+import uuid
+from contextlib import asynccontextmanager
 
-from fastapi import FastAPI,Depends
+import aiomqtt
+from fastapi import FastAPI,Depends,Request
 from sqlalchemy.orm import Session
+
 from app.database import engine,Base,get_db
 from app import models
 from app.schemas import CommandRequest,CommandResponse
@@ -13,7 +15,18 @@ from app.schemas import CommandRequest,CommandResponse
 
 from fastapi.middleware.cors import CORSMiddleware
 
-app = FastAPI()
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+
+    async with aiomqtt.Client(hostname="localhost", port=1883) as client:
+
+        # noinspection PyUnresolvedReferences
+        app.state.mqtt = client
+        print("MQTT connected")
+        yield
+
+
+app = FastAPI(lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -32,7 +45,7 @@ def read_root():
     return {"message": "Cloud backend is running"}
 
 @app.post("/api/v1/commands")
-async def create_command(command: CommandRequest,db: Session = Depends(get_db)):
+async def create_command(request: Request, command: CommandRequest,db: Session = Depends(get_db)):
 
     command_id = str(uuid.uuid4())
 
@@ -44,14 +57,14 @@ async def create_command(command: CommandRequest,db: Session = Depends(get_db)):
     db.add(new_item)
     db.commit()
 
-    async with aiomqtt.Client(hostname="localhost", port=1883) as client:
-        await client.publish(
-            "microduck/robot01/cmd",
-            json.dumps({
-                "command_id": command_id,
-                "action": command.action
-            })
-        )
+    client = request.app.state.mqtt
+    await client.publish(
+        "microduck/robot01/cmd",
+        json.dumps({
+            "command_id": command_id,
+            "action": command.action
+        })
+    )
 
     return CommandResponse(
         command_id=command_id,
