@@ -4,9 +4,9 @@ import json
 
 from fastapi import FastAPI,Depends
 from sqlalchemy.orm import Session
-from backend.app.database import engine,Base,get_db
-from backend.app import models
-from backend.app.schemas import CommandRequest,CommandResponse
+from app.database import engine,Base,get_db
+from app import models
+from app.schemas import CommandRequest,CommandResponse
 
 
 

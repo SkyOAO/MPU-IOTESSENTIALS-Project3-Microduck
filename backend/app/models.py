@@ -1,6 +1,9 @@
 from sqlalchemy import Column, Integer, String, DateTime
 from datetime import datetime,timezone
-from backend.app.database import Base
+from app.database import Base
+from datetime import datetime, timezone, timedelta
+
+CN_TZ = timezone(timedelta(hours=8))
 
 class Command(Base):
     __tablename__ = 'commands'
@@ -14,7 +17,7 @@ class Command(Base):
     #状态
     status = Column(String)
     #创建时间
-    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
     #完成时间
     completed_at = Column(DateTime, nullable=True)
 

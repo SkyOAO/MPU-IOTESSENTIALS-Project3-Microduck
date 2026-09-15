@@ -1,1 +1,6 @@
-DATABASE_URL = "postgresql://cloud:cloud@localhost:5432/microduck"
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+DATABASE_URL = os.getenv("DATABASE_URL")

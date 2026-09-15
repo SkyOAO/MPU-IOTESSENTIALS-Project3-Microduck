@@ -1,8 +1,7 @@
 import asyncio
 import aiomqtt
-import sys
-if sys.platform == 'win32':
-    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
+
 async def main():
     # 1. 连上本机的 EMQX
     async with aiomqtt.Client("localhost", 1883) as client:
