@@ -1,4 +1,5 @@
 import json
+import time
 import uuid
 from contextlib import asynccontextmanager
 
@@ -51,7 +52,7 @@ async def create_command(request: Request, command: CommandRequest,db: Session =
 
     new_item = models.Command(
         command_id=command_id,
-        action=command.action,
+        action=command.op,
         status="received",
     )
     db.add(new_item)
@@ -61,14 +62,18 @@ async def create_command(request: Request, command: CommandRequest,db: Session =
     await client.publish(
         "microduck/robot01/cmd",
         json.dumps({
-            "command_id": command_id,
-            "action": command.action
-        })
+            "msg_id": command_id,
+            "robot_id": command.robot_id,
+            "op": command.op,
+            "params": command.params,
+            "timestamp": int(time.time() * 1000),        # 毫秒，后端生成
+        }),
+        qos=1,                                        # 至少送达一次
     )
 
     return CommandResponse(
         command_id=command_id,
-        action=command.action,
+        op=command.op,
         status="received",
     )
 
