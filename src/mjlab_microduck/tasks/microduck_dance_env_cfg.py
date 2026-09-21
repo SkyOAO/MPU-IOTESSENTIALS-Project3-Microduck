@@ -133,9 +133,8 @@ def make_microduck_dance_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     cfg.rewards["dance_tracking"] = RewardTermCfg(
         func=microduck_mdp.dance_tracking,
         weight=2.0,
-        params={"period_s": 2.0, "amplitude": 0.3, "std": 0.3,},
+        params={"amplitude": 0.3, "std": 0.3,},
     )
-
     # ── Observations (identical layout to walking / standup policies) ─────────
     del cfg.observations["actor"].terms["base_lin_vel"]
 
@@ -207,17 +206,12 @@ def make_microduck_dance_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
         )
 
     # ── Command: tiny noise around zero (kept for obs-shape parity) ──────────
-    command = cfg.commands["twist"]
-    command.rel_standing_envs = 0.0
-    command.rel_heading_envs  = 0.0
-    command.heading_command   = False
-    command.ranges.heading    = None
-    command.resampling_time_range = (EPISODE_LENGTH_S, EPISODE_LENGTH_S * 2)
-    command.debug_vis = False
-    command.ranges.lin_vel_x = (-0.01, 0.01)
-    command.ranges.lin_vel_y = (-0.01, 0.01)
-    command.ranges.ang_vel_z = (-0.05, 0.05)
-    cfg.commands["twist"] = microduck_mdp.VelocityCommandCommandOnlyCfg(**vars(command))
+    # Use phase command instead: command = [cos(2πφ), sin(2πφ), 0]
+    # The phase advances automatically over time; period is controlled by the period parameter.
+    cfg.commands["twist"] = microduck_mdp.GroundPickPhaseCommandCfg(
+        period=2.0,            # dance period in seconds
+        randomize_phase=False, # each episode starts at phase=0
+    )
 
     # ── Terminations ──────────────────────────────────────────────────────────
     # Falling over, NaN guard + timeout.

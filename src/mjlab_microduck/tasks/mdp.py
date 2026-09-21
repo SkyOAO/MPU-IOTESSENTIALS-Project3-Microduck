@@ -167,7 +167,7 @@ def dance_phase(env: ManagerBasedRlEnv, period_s: float = 2.0) -> torch.Tensor:
 
 def dance_tracking(
     env: ManagerBasedRlEnv,
-    period_s: float = 2.0,
+    command_name: str = "twist",
     amplitude: float = 0.3,
     std: float = 0.3,
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
@@ -177,7 +177,9 @@ def dance_tracking(
     Uses the phase to drive a sinusoidal reference and encourages joint tracking.
     """
     asset: Entity = env.scene[asset_cfg.name]
-    phase = dance_phase(env, period_s)
+    # Decode phase from command: command = [cos(2πφ), sin(2πφ), 0]
+    cmd = env.command_manager.get_command(command_name)
+    phase = (torch.atan2(cmd[:, 1], cmd[:, 0]) / (2 * math.pi)) % 1.0
     phi = 2.0 * math.pi * phase  # convert to radians
 
     # Target angles for the 14 servos (default = HOME, then adjusted by sine)
@@ -203,7 +205,7 @@ def dance_tracking(
 
     # Gaussian tracking reward
     return torch.exp(-((actual - target) / std) ** 2).mean(dim=-1)
-
+    
 
 def reset_with_forward_velocity(
     env: ManagerBasedRlEnv,
