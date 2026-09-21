@@ -1,50 +1,15 @@
-"""Microduck dance task — attempt 3, run 2.
+"""Microduck stationary dance task.
 
-Episodic policy: robot starts standing, performs a stationary dance
-(alternating steps, hip sway, head turn/nod), spins a full 360° turn in
-place, then rolls forward over the flat top of its head and lands back on
-its feet. Triggered at deployment like sit/standup (policy switch = sequence
-starts immediately; no phase clock, no reference motion).
-
-RUN-2 REWORK (run 1 learned a violent ballistic "breakdance" whip — optimal
-under the run-1 rewards: same 2π, sooner, no cost): rotation now only counts
-while the robot touches the ground (support-gated accumulator — a roulade
-never leaves the floor), the landing annuity requires an over-the-head
-contact latch, paid progress rate is capped at 3 rad/s (faster forfeits the
-excess), an overspeed penalty taxes |ω| > 4 rad/s, and the impact/smoothness
-penalties are active from step 0 (discovery in this env is easy; style is
-the scarce resource, not exploration).
-
-Design (see the roulade section of mdp.py for the full history):
-  • ONE dense progress signal — paid increments of the max-so-far cumulative
-    forward rotation (potential-based: full roll pays 2π worth total, camping
-    anywhere pays zero per step).
-  • Landing rewards gated on ROLL COMPLETION (rotation frontier ≥ ~260°), not
-    on a clock — "do nothing" earns nothing, the standing spawn cannot farm
-    them, and no upright/height pressure ever opposes the flip.
-  • Reverse curriculum via mid-roll spawns (the trick that fixed face-up
-    recovery in standup): a slice of episodes starts 50°–185° into the roll,
-    tucked, with forward angular momentum, accumulator pre-set to the spawn
-    angle. The second half of a roulade IS the face-up recovery problem, which
-    we know is learnable.
-  • Élan hook for later: reset_roulade_state.forward_vel_range gives standing
-    spawns an initial forward base velocity — set ROULADE_FORWARD_VEL_RANGE
-    to e.g. (0.0, 0.3) to train rolls out of a walk. (0, 0) = standstill-only.
-
-DR / obs / regularisers mirror the standup env (velocity sim2real parity),
-with the motion-blockers (body_ang_vel, |a_z|, arrival damping) kept near zero
-during discovery and introduced late by curriculum — the roll IS a large
-angular-velocity, large-impact event; taxing attempts prevents discovery
-(proven twice on standup).
+Episodic policy: robot starts standing and performs a stationary rhythmic
+dance — alternating foot stepping, hip sway, head turn/nod. Triggered at
+deployment like sit/standup (policy switch = dance starts immediately).
 """
 
 import math
 from copy import deepcopy
 
-# Symmetry — the roll is sagittal / left-right symmetric; the mirror loss
-# directly fights the sideways-collapse failure seen in run 2. Enabled after
-# migrating symmetry.py to the 61-dim layout (2026-08-13, includes the
-# "policy" → "actor" output-key fix; roulade is the first env to use it).
+# Symmetry — the dance is left-right symmetric; the mirror loss helps keep
+# both legs moving in sync.
 ENABLE_SYMMETRY = True
 
 # ── Domain randomisation (matched to standup/velocity for sim2real parity) ───
@@ -55,7 +20,7 @@ ENABLE_KD_RANDOMIZATION              = False  # match velocity (OFF)
 ENABLE_MASS_INERTIA_RANDOMIZATION    = True
 ENABLE_JOINT_FRICTION_RANDOMIZATION  = True
 ENABLE_ARMATURE_RANDOMIZATION        = True
-ENABLE_VELOCITY_PUSHES               = False  # a push mid-roll is incoherent
+ENABLE_VELOCITY_PUSHES               = False  # no pushes during stationary dance
 ENABLE_IMU_ORIENTATION_RANDOMIZATION = True
 ENABLE_ENCODER_BIAS                  = True
 
@@ -76,49 +41,6 @@ EPISODE_LENGTH_S = 5.0
 
 # Empirically-measured standing trunk height (standup lesson: don't guess).
 STAND_Z = 0.115
-
-# ── Élan (run-up) hook ────────────────────────────────────────────────────────
-# (0, 0) = roll from a standstill (run 1). Widen to e.g. (0.0, 0.3) to train
-# rolls entered with forward momentum — standing spawns then get a random
-# initial forward base velocity, approximating a hand-off from the walking
-# policy without simulating the walk itself.
-ROULADE_FORWARD_VEL_RANGE = (0.0, 0.0)
-
-# ── Mid-roll spawn (reverse curriculum) ───────────────────────────────────────
-# 90° = balanced on the head, 180° = on the back, 270° = supine, ~340° = seated
-# leaning back, >260° opens the landing gate. Run-3 change: MAX widened
-# 185° → 340° — run-2 wandb showed the second half of the roll (supine →
-# seated → rise) was never spawned and never learned; spawns past ~300° open
-# the landing gate at birth, giving dense on-policy data on the crouch→stand
-# last mile (the velstand run-5 crouch-basin lesson).
-MIDROLL_PITCH_MIN   = math.radians(50.0)
-MIDROLL_PITCH_MAX   = math.radians(340.0)
-MIDROLL_OMEGA_RANGE = (0.0, 3.0)   # rad/s forward momentum at spawn
-# Tuck anchor: legs folded (crouch-anchor values from the velstand crouch
-# reset) + CHIN TUCK (run-5: neck_pitch −1 / head_pitch +1 puts the flat head
-# top squarely on the floor — measured axis_z −0.99 vs +0.6 for the passive
-# face-plant; the head-top latch requires this, so mid-roll spawns must
-# demonstrate the tucked configuration). Servo-index keyed; mid-roll spawns
-# lerp HOME→tuck by a per-env factor.
-TUCK_OVERRIDES = {
-    2:  -1.15,  # left  hip_pitch
-    3:   1.25,  # left  knee
-    4:   1.05,  # left  ankle
-    5:  -1.0,   # neck_pitch  (chin tuck)
-    6:   1.0,   # head_pitch  (chin tuck)
-    11:  1.15,  # right hip_pitch
-    12: -1.25,  # right knee
-    13: -1.05,  # right ankle
-}
-
-# Rotation thresholds (rad) for the state-based gates.
-LANDING_GATE_LO = math.radians(260.0)
-LANDING_GATE_HI = math.radians(330.0)
-RISE_GATE_LO    = math.radians(180.0)
-RISE_GATE_HI    = math.radians(260.0)
-
-_LEG_JOINTS  = [0, 1, 2, 3, 4, 9, 10, 11, 12, 13]
-_NECK_JOINTS = [5, 6, 7, 8]
 
 from mjlab.envs import ManagerBasedRlEnvCfg
 from mjlab.envs.mdp import dr
@@ -163,48 +85,13 @@ def make_microduck_dance_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
         track_air_time=True,
     )
 
-    self_collision_cfg = ContactSensorCfg(
-        name="self_collision",
-        primary=ContactMatch(mode="subtree", pattern="trunk_base", entity="robot"),
-        secondary=ContactMatch(mode="subtree", pattern="trunk_base", entity="robot"),
-        fields=("found",),
-        reduce="none",
-        num_slots=1,
-    )
-
-    # Head-ground contact — the roll's pivot signal. jaw_soft is the body that
-    # carries the head collision geoms (top_head_shell = the flat top, jaw,
-    # bottom_head_shell) in robot_groundcontact.xml. NAME IS LOAD-BEARING:
-    # _update_roulade_accum reads it for the over-the-head latch.
-    head_ground_cfg = ContactSensorCfg(
-        name="head_ground_contact",
-        primary=ContactMatch(mode="body", pattern="jaw_soft", entity="robot"),
-        secondary=ContactMatch(mode="body", pattern="terrain"),
-        fields=("found",),
-        reduce="none",
-        num_slots=1,
-    )
-
-    # Whole-robot ground contact — the SUPPORT GATE (run-2 fix): the rotation
-    # accumulator only integrates while some robot geom touches the terrain,
-    # so ballistic flips ("breakdance") earn no progress and never complete.
-    # NAME IS LOAD-BEARING: _update_roulade_accum reads it.
-    robot_ground_cfg = ContactSensorCfg(
-        name="robot_ground_contact",
-        primary=ContactMatch(mode="subtree", pattern="trunk_base", entity="robot"),
-        secondary=ContactMatch(mode="body", pattern="terrain"),
-        fields=("found",),
-        reduce="none",
-        num_slots=1,
-    )
-
     foot_frictions_geom_names = ("left_foot_collision", "right_foot_collision")
 
     # ── Base config ───────────────────────────────────────────────────────────
     cfg = make_velocity_env_cfg()
 
     cfg.scene.entities = {"robot": MICRODUCK_STANDUP_ROBOT_CFG}
-    cfg.scene.sensors  = (feet_ground_cfg, self_collision_cfg, head_ground_cfg, robot_ground_cfg)
+    cfg.scene.sensors  = (feet_ground_cfg,)
     cfg.viewer.body_name = "trunk_base"
 
     cfg.episode_length_s = EPISODE_LENGTH_S
@@ -227,144 +114,6 @@ def make_microduck_dance_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
         if name in cfg.rewards:
             del cfg.rewards[name]
 
-    # ── Rewards: roulade task set ─────────────────────────────────────────────
-    # Progress increments — the one dense task signal during the roll. During
-    # a 1.5 s roll it averages ~0.7/step; total payout per full roll from a
-    # standing spawn ≈ weight × (episode steps it took) × mean ≈ weight × 50.
-    cfg.rewards["roulade_progress"] = RewardTermCfg(
-        func=microduck_mdp.roulade_progress,
-        weight=8.0,
-        # max_paid_rate: run-4 raised 3 → 5 rad/s. Measured physics (run-3
-        # checkpoint eval): the over-the-top transit runs at 3.5–5.5 rad/s —
-        # this robot is 10 cm tall, its natural tumble timescale is fast, and
-        # the 3 rad/s cap was forfeiting most of the physically-necessary
-        # rotation. Style pressure lives in |a_z| / action_rate / the support
-        # gate, not in fighting gravity's clock.
-        params={"target_angle": 2 * math.pi, "max_paid_rate": 5.0},
-    )
-
-    # Whip-speed tax — run-4 threshold 4 → 7 rad/s (above the measured p90
-    # transit speed of ~5.5): taxes genuine whips, not the natural tumble.
-    cfg.rewards["roulade_overspeed"] = RewardTermCfg(
-        func=microduck_mdp.roulade_overspeed_penalty,
-        weight=-0.1,
-        params={"omega_max": 7.0},
-    )
-
-    # Head-as-pivot shaping: contact × mid-roll window × forward-rate factor
-    # (the rate factor kills the "rest face-down with head on floor" farm).
-    cfg.rewards["roulade_head_pivot"] = RewardTermCfg(
-        func=microduck_mdp.roulade_head_pivot,
-        weight=0.5,
-        params={
-            "sensor_name": head_ground_cfg.name,
-            "angle_lo": math.radians(30.0),
-            "angle_hi": math.radians(240.0),
-            "rate_norm": 2.0,
-        },
-    )
-
-    # Completion-gated standing annuity — the dominant attractor. Broad stds
-    # (standup composite lesson: partial landing must score visibly, ~0.2+).
-    cfg.rewards["roulade_landing_composite"] = RewardTermCfg(
-        func=microduck_mdp.roulade_landing_composite,
-        weight=4.0,
-        params={
-            "target_height":    STAND_Z,
-            "height_std":       0.04,
-            "upright_std":      0.40,
-            "pose_std":         0.40,
-            "joint_indices":    _LEG_JOINTS,
-            "gate_lo":          LANDING_GATE_LO,
-            "gate_hi":          LANDING_GATE_HI,
-            "target_overrides": None,
-        },
-    )
-
-    # Completion-gated bootstrap layers (gradient far from the goal, where the
-    # composite product is ≈0): linear upright + broad height Gaussian.
-    cfg.rewards["roulade_upright_after_roll"] = RewardTermCfg(
-        func=microduck_mdp.roulade_upright_after_roll,
-        weight=1.5,
-        params={"gate_lo": LANDING_GATE_LO, "gate_hi": LANDING_GATE_HI},
-    )
-    cfg.rewards["roulade_height_after_roll"] = RewardTermCfg(
-        func=microduck_mdp.roulade_height_after_roll,
-        weight=1.0,
-        params={
-            "target_height": STAND_Z,
-            "std":           0.04,
-            "gate_lo":       LANDING_GATE_LO,
-            "gate_hi":       LANDING_GATE_HI,
-        },
-    )
-
-    # Sharp landing layer (run-4): tight-std upright × height product on top
-    # of the broad composite. Run-3 eval showed EVERY completed episode
-    # parking at the same z≈0.105 / 27°-lean pose — the broad stds score ~0.5
-    # there, no gradient to finish. Sharp layer: ~0.1 at the basin, ~1.0
-    # upright — 10× differential across the last mile.
-    cfg.rewards["roulade_landing_sharp"] = RewardTermCfg(
-        func=microduck_mdp.roulade_landing_sharp,
-        weight=2.0,
-        params={
-            "target_height": STAND_Z,
-            "height_std":    0.015,
-            "upright_std":   0.3,
-            "gate_lo":       LANDING_GATE_LO,
-            "gate_hi":       LANDING_GATE_HI,
-        },
-    )
-
-    # Completion-gated stand tax (run-3, THE standup lesson): once the
-    # rotation is done, every step spent below STAND_Z costs — "crumple in a
-    # heap after the roll" flips from free to net-negative, the same fix that
-    # broke standup's static-sit basin (its height L1 at ÷4-scaled weight
-    # 7.5). Gate closed during the roll, so the roll itself is never taxed;
-    # mid/late-roll spawns are born with it active, which is the point.
-    cfg.rewards["roulade_stand_tax"] = RewardTermCfg(
-        func=microduck_mdp.roulade_stand_tax,
-        weight=5.0,
-        params={
-            "target_height": STAND_Z,
-            "gate_lo":       LANDING_GATE_LO,
-            "gate_hi":       LANDING_GATE_HI,
-        },
-    )
-
-    # Exit-rise bootstrap: upward CoM velocity, gated to the late-roll region
-    # (supine → up is the face-up-recovery problem; end-state rewards have zero
-    # gradient at zero motion there — standup lesson #2).
-    cfg.rewards["roulade_rise_velocity"] = RewardTermCfg(
-        func=microduck_mdp.roulade_rise_velocity,
-        weight=0.75,
-        params={
-            "max_height": STAND_Z + 0.01,
-            "gate_lo":    RISE_GATE_LO,
-            "gate_hi":    RISE_GATE_HI,
-        },
-    )
-
-    # Straightness — run-5: the run-4 policy rolled over the SHOULDER (lower
-    # energy path than straight over the head — it avoids the fully-inverted
-    # configuration, same cheat human beginners default to). The structural
-    # fix is the flatness gate on the accumulator + the head-top latch (side
-    # rolls no longer count as rotation at all); these penalties provide the
-    # dense per-step gradient back toward the plane, weights raised 5× from
-    # the run-2 values that were noise against progress@8.
-    cfg.rewards["roulade_sagittal"] = RewardTermCfg(
-        func=microduck_mdp.roulade_sagittal_penalty,
-        weight=-0.1,
-    )
-    cfg.rewards["roulade_lateral_vel"] = RewardTermCfg(
-        func=microduck_mdp.roulade_lateral_velocity_penalty,
-        weight=-0.5,
-    )
-    cfg.rewards["roulade_flatness"] = RewardTermCfg(
-        func=microduck_mdp.roulade_flatness_penalty,
-        weight=-0.5,
-    )
-
     # ── Sim2real regularisers ─────────────────────────────────────────────────
     # Motion-blockers stay near zero during discovery (the roll IS a large
     # angular-velocity + impact event); the settle/polish pressure comes from
@@ -379,46 +128,6 @@ def make_microduck_dance_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     cfg.rewards["body_ang_vel"].weight = -0.002   # must stay ≈0: the roll is ω
     cfg.rewards["angular_momentum"].weight = -0.001
     cfg.rewards.pop("soft_landing", None)
-
-    # Arrival damper — trunk ω_xy² gated on standing height AND low tilt, so
-    # the roll itself is never taxed; introduced at 0 and ramped by curriculum.
-    cfg.rewards["arrival_damping"] = RewardTermCfg(
-        func=microduck_mdp.body_ang_vel_at_height,
-        weight=0.0,
-        params={
-            "height_low":    0.09,
-            "height_high":   0.11,
-            "tilt_full_deg": 20.0,
-            "tilt_zero_deg": 45.0,
-            "asset_cfg":     SceneEntityCfg("robot", body_names=("trunk_base",)),
-        },
-    )
-
-    # |a_z| impact shaping — active from step 0 (run-2 change: run 1
-    # discovered a violent solution under zero impact cost and locked it in;
-    # discovery is easy in this env, so shaping the style from the start is
-    # the priority). Curriculum ramps it further.
-    # NOTE: trunk_vertical_accel_penalty is SELF-NEGATING (returns -|a_z|) →
-    # POSITIVE weight (penalty sign convention; a negative weight here would
-    # reward violence — caught in the run-2 smoke test, sum was positive).
-    cfg.rewards["gentle_landing"] = RewardTermCfg(
-        func=microduck_mdp.trunk_vertical_accel_penalty,
-        weight=0.002,
-        params={"asset_cfg": SceneEntityCfg("robot", body_names=("trunk_base",))},
-    )
-
-    # Self-collision — LIGHT: a tucked roll needs body-on-body contact
-    # (knees against trunk); standup's -1.0 would fight the tuck.
-    cfg.rewards["self_collisions"] = RewardTermCfg(
-        func=mdp.self_collision_cost,
-        weight=-0.1,
-        params={"sensor_name": self_collision_cfg.name},
-    )
-
-    # Always-on upright would oppose the flip (the old attempt's core failure);
-    # landing uprightness is handled by the completion-gated terms above.
-    if "upright" in cfg.rewards:
-        del cfg.rewards["upright"]
 
     # ── Dance rewards ─────────────────────────────────────────────────
     cfg.rewards["dance_tracking"] = RewardTermCfg(
@@ -511,9 +220,7 @@ def make_microduck_dance_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     cfg.commands["twist"] = microduck_mdp.VelocityCommandCommandOnlyCfg(**vars(command))
 
     # ── Terminations ──────────────────────────────────────────────────────────
-    # Falling over is the task — keep only the NaN guard + timeout.
-    if "fell_over" in cfg.terminations:
-        del cfg.terminations["fell_over"]
+    # Falling over, NaN guard + timeout.
     cfg.terminations["nan_state"] = TerminationTermCfg(
         func=microduck_mdp.robot_state_is_nan,
         time_out=False,
@@ -530,30 +237,6 @@ def make_microduck_dance_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     )
     cfg.events["foot_friction"].params["asset_cfg"].geom_names = foot_frictions_geom_names
     cfg.events["foot_friction"].params["ranges"] = (0.7, 1.3)
-
-    # Standing start + mid-roll reverse-curriculum spawns; also resets the
-    # rotation accumulator (must run after reset_robot_joints — dict insertion
-    # order — since mid-roll tuck lerps FROM the HOME pose it wrote).
-    cfg.events["set_roulade_state"] = EventTermCfg(
-        func=microduck_mdp.reset_roulade_state,
-        mode="reset",
-        params={
-            "standing_prob":      0.5,
-            "midroll_prob":       0.5,
-            "standing_z_min":     0.11,
-            "standing_z_max":     0.12,
-            "standing_tilt_max":  math.radians(5.0),
-            "forward_vel_range":  ROULADE_FORWARD_VEL_RANGE,
-            "midroll_pitch_min":  MIDROLL_PITCH_MIN,
-            "midroll_pitch_max":  MIDROLL_PITCH_MAX,
-            "midroll_z_min":      0.05,
-            "midroll_z_max":      0.10,
-            "midroll_omega_range": MIDROLL_OMEGA_RANGE,
-            "tuck_overrides":     TUCK_OVERRIDES,
-            "tuck_factor_range":  (0.3, 1.0),
-            "joint_noise_std":    0.08,
-        },
-    )
 
     if "push_robot" in cfg.events:
         del cfg.events["push_robot"]
@@ -643,17 +326,6 @@ def make_microduck_dance_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     # mid-roll BEFORE standing-spawn rolls were mastered (progress episode-sum
     # was ~20% of a full roll at iter 1876; curriculum-pacing failure, same
     # family as the 2026-07-28 standup regression).
-    cfg.curriculum["roulade_spawn_mix"] = CurriculumTermCfg(
-        func=microduck_mdp.event_param_curriculum,
-        params={
-            "event_name": "set_roulade_state",
-            "param_stages": [
-                {"step": 0,          "params": {"standing_prob": 0.50, "midroll_prob": 0.50}},
-                {"step": 3000 * 24,  "params": {"standing_prob": 0.65, "midroll_prob": 0.35}},
-                {"step": 6000 * 24,  "params": {"standing_prob": 0.80, "midroll_prob": 0.20}},
-            ],
-        },
-    )
 
     if ENABLE_COM_RANDOMIZATION:
         cfg.curriculum["com_range"] = CurriculumTermCfg(
@@ -695,43 +367,6 @@ def make_microduck_dance_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
                 {"step": 0,          "weight": -0.1},
                 {"step": 1500 * 24,  "weight": -0.2},
                 {"step": 3000 * 24,  "weight": -0.4},
-            ],
-        },
-    )
-
-    # Smoothness polish — introduced only after the roll skill exists (standup
-    # timing lesson: any attempt-tax active during discovery prevents the
-    # maneuver from being found at all; fix is timing, not magnitude).
-    cfg.curriculum["arrival_damping_weight"] = CurriculumTermCfg(
-        func=microduck_mdp.reward_weight,
-        params={
-            "reward_name":   "arrival_damping",
-            "weight_stages": [
-                {"step": 0,          "weight": 0.0},
-                {"step": 2500 * 24,  "weight": -0.025},
-                {"step": 3500 * 24,  "weight": -0.05},
-            ],
-        },
-    )
-    cfg.curriculum["torque_rate_weight"] = CurriculumTermCfg(
-        func=microduck_mdp.reward_weight,
-        params={
-            "reward_name":   "joint_torque_rate_l2",
-            "weight_stages": [
-                {"step": 0,          "weight": 0.0},
-                {"step": 2500 * 24,  "weight": -5e-4},
-                {"step": 3500 * 24,  "weight": -1e-3},
-            ],
-        },
-    )
-    cfg.curriculum["gentle_landing_weight"] = CurriculumTermCfg(
-        func=microduck_mdp.reward_weight,
-        params={
-            # POSITIVE weights: the func is self-negating (returns -|a_z|).
-            "reward_name":   "gentle_landing",
-            "weight_stages": [
-                {"step": 0,          "weight": 0.002},
-                {"step": 2500 * 24,  "weight": 0.005},
             ],
         },
     )

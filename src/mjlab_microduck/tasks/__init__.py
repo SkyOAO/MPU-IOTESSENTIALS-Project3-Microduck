@@ -239,7 +239,7 @@ register_mjlab_task(
     runner_cls=MicroduckOnPolicyRunner,
 )
 
-# Dance — dance in place, then spin once, followed by a forward roll.
+# Dance — stationary dance.
 register_mjlab_task(
     task_id="Mjlab-Dance-Flat-MicroDuck",
     env_cfg=make_microduck_dance_env_cfg(),
