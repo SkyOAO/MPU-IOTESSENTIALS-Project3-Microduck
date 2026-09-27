@@ -68,9 +68,10 @@ BASE_ORIENTATION_MAX_PITCH_DEG = 10.0  # ±10° forward/backward tilt at episode
 BASE_ORIENTATION_MAX_ROLL_DEG = 5.0  # ±5° side-to-side tilt at episode start
 
 # Dance timing and geometry
-DANCE_PERIOD_S = 12.0          # one full left-right-left cycle
-DANCE_LATERAL_AMP = 0.15       # lateral half-range in metres
+DANCE_PERIOD_S = 8.0          # one full left-right-left cycle
+DANCE_LATERAL_AMP = 0.10       # lateral half-range in metres
 DANCE_HEAD_YAW_AMP = 0.5       # head yaw target amplitude in radians
+DANCE_LATERAL_SPEED = DANCE_LATERAL_AMP / (DANCE_PERIOD_S / 4.0)
 EPISODE_LENGTH_S = DANCE_PERIOD_S + 2.0
 
 import mujoco as _mujoco
@@ -285,6 +286,10 @@ def make_microduck_dance_env_cfg(
     cfg.rewards["upright"].weight = 2.0
     cfg.rewards["upright"].params["std"] = math.sqrt(0.05)
 
+    # foot_clearance and foot_slip still read foot sites from asset_cfg.
+    for reward_name in ["foot_clearance", "foot_slip"]:
+        cfg.rewards[reward_name].params["asset_cfg"].site_names = site_names
+
     # Body-specific configurations
     cfg.rewards["body_ang_vel"].params["asset_cfg"].body_names = ("trunk_base",)
 
@@ -302,29 +307,25 @@ def make_microduck_dance_env_cfg(
 
     cfg.rewards["dance_lateral_tracking"] = RewardTermCfg(
         func=microduck_mdp.dance_lateral_tracking,
-        weight=3.0,
-        params={
-            "command_name": "twist",
-            "amplitude": DANCE_LATERAL_AMP,
-            "std": 0.08,
-        },
-    )
-
-    cfg.rewards["dance_lateral_velocity_tracking"] = RewardTermCfg(
-        func=microduck_mdp.dance_lateral_velocity_tracking,
         weight=2.0,
         params={
             "command_name": "twist",
             "amplitude": DANCE_LATERAL_AMP,
             "period_s": DANCE_PERIOD_S,
-            "std": 0.05,
+            "std": 0.08,
         },
+    )
+
+    cfg.rewards["dance_forward_tracking"] = RewardTermCfg(
+        func=microduck_mdp.dance_forward_tracking,
+        weight=1.0,
+        params={"std": 0.03},
     )
 
     cfg.rewards["dance_heading_tracking"] = RewardTermCfg(
         func=microduck_mdp.dance_heading_tracking,
-        weight=0.3,
-        params={"std": 0.25},
+        weight=1.5,
+        params={"std": 0.20},
     )
 
     cfg.rewards["dance_head_yaw_tracking"] = RewardTermCfg(
@@ -333,20 +334,39 @@ def make_microduck_dance_env_cfg(
         params={
             "command_name": "twist",
             "amplitude": DANCE_HEAD_YAW_AMP,
+            "period_s": DANCE_PERIOD_S,
             "std": 0.25,
         },
     )
 
-    for name in [
-        "track_linear_velocity",
-        "track_angular_velocity",
-        "air_time",
-        "foot_clearance",
-        "foot_swing_height",
-        "foot_slip",
-    ]:
-        if name in cfg.rewards:
-            del cfg.rewards[name]
+    cfg.rewards["dance_head_pitch_tracking"] = RewardTermCfg(
+        func=microduck_mdp.dance_head_pitch_tracking,
+        weight=0.5,
+        params={"std": 0.15},
+    )
+
+    # Keep the velocity-template walking rewards. The new twist command is
+    # [0, vy_ref, 0], so track_linear_velocity teaches lateral walking while
+    # track_angular_velocity resists turning (its command is zero).
+    cfg.rewards["track_linear_velocity"].weight = 2.0
+    cfg.rewards["track_linear_velocity"].params["std"] = math.sqrt(0.1)
+
+    cfg.rewards["track_angular_velocity"].weight = 2.0
+    cfg.rewards["track_angular_velocity"].params["std"] = math.sqrt(0.5)
+
+    cfg.rewards["air_time"].weight = 3.0
+    cfg.rewards["air_time"].params["command_threshold"] = 0.01
+    cfg.rewards["air_time"].params["threshold_min"] = 0.125
+    cfg.rewards["air_time"].params["threshold_max"] = 0.300
+
+    cfg.rewards["foot_clearance"].params["command_threshold"] = 0.01
+    cfg.rewards["foot_clearance"].params["target_height"] = 0.02
+
+    cfg.rewards["foot_swing_height"].params["command_threshold"] = 0.01
+    cfg.rewards["foot_swing_height"].params["target_height"] = 0.02
+
+    cfg.rewards["foot_slip"].weight = -0.1
+    cfg.rewards["foot_slip"].params["command_threshold"] = 0.01
 
     cfg.rewards["body_ang_vel"].weight = -0.05
     cfg.rewards["angular_momentum"].weight = -0.02
@@ -639,20 +659,19 @@ def make_microduck_dance_env_cfg(
     else:
         cfg.events.pop("encoder_bias", None)
 
-    # Commands — replace the base velocity command with a fixed cyclic phase.
-    # deepcopy first because make_velocity_env_cfg() returns shared mutable configs.
-    # The phase command still occupies the 3D "twist" observation slot:
-    # [cos(2*pi*phase), sin(2*pi*phase), 0].
-    # dance_* reward functions in mdp.py decode phase from this vector.
+    # Replace the base velocity command with a fixed lateral-velocity phase.
+    # The twist slot stays 3D but now means [vx=0, vy_ref, vtheta=0], so the
+    # velocity walking rewards can teach the lateral gait directly.
     command = deepcopy(cfg.commands["twist"])
     command.rel_standing_envs = 0.0
     command.rel_heading_envs = 0.0
 
-    cfg.commands["twist"] = microduck_mdp.GroundPickPhaseCommandCfg(
+    cfg.commands["twist"] = microduck_mdp.DanceLateralVelocityCommandCfg(
         **{
             **vars(command),
-            "class_type": microduck_mdp.GroundPickPhaseCommand,
+            "class_type": microduck_mdp.DanceLateralVelocityCommand,
             "period": DANCE_PERIOD_S,
+            "lateral_speed": DANCE_LATERAL_SPEED,
             "randomize_phase": False,
         }
     )

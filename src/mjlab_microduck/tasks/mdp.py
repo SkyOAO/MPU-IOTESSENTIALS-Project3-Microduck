@@ -5029,50 +5029,74 @@ class GroundPickPhaseCommandCfg(UniformVelocityCommandCfg):
         return GroundPickPhaseCommand(self, env)
 
 
-def dance_phase_from_command(
-    env: ManagerBasedRlEnv,
-    command_name: str = "twist",
-) -> torch.Tensor:
-    """Decode the cyclic phase from the phase command.
+class DanceLateralVelocityCommand(UniformVelocityCommand):
+    """Phase-driven lateral velocity command for the lateral-patrol dance.
 
-    The command is assumed to be [cos(2*pi*phase), sin(2*pi*phase), 0].
-    Returned phase must be wrapped into [0, 1).
+    The command occupies the normal 3D twist slot as ``[0, vy_ref, 0]``.
+    ``vy_ref`` is piecewise constant: negative while moving left, positive
+    while moving right, and the sign flips every quarter cycle.
     """
-    cmd = env.command_manager.get_command(command_name)
-    phase = torch.atan2(cmd[:, 1], cmd[:, 0]) / (2*math.pi) % 1.0
-    return phase
 
-def dance_lateral_reference(
-    phase: torch.Tensor,
-    amplitude: float,
-) -> torch.Tensor:
-    """Map one dance cycle to the lateral reference position.
+    PERIOD: float = 8.0
+    LATERAL_SPEED: float = 0.05
 
-    One cycle has four equal segments:
-    [0.00, 0.25): move left,  0      -> -amplitude
-    [0.25, 0.50): return,     -amplitude -> 0
-    [0.50, 0.75): move right, 0      -> +amplitude
-    [0.75, 1.00): return,     +amplitude -> 0
-    """
-    y_ref = torch.zeros_like(phase)
+    def __init__(self, cfg, env: ManagerBasedRlEnv):
+        super().__init__(cfg, env)
+        self._dance_phase = torch.zeros(self.num_envs, device=self.device)
+        self._period = float(getattr(cfg, "period", self.PERIOD))
+        self._lateral_speed = float(getattr(cfg, "lateral_speed", self.LATERAL_SPEED))
+        self._randomize_phase = bool(getattr(cfg, "randomize_phase", False))
 
-    left_move = phase < 0.25
-    t_left = phase / 0.25
-    y_ref = torch.where(left_move, -amplitude * t_left, y_ref)
+    @property
+    def command(self) -> torch.Tensor:
+        return self.vel_command_b
 
-    ret_left = (phase >= 0.25) & (phase < 0.50)
-    t_ret_left = (phase - 0.25) / 0.25
-    y_ref = torch.where(ret_left, -amplitude + amplitude * t_ret_left, y_ref)
+    def compute(self, dt: float) -> None:
+        # This is a one-shot episodic gesture: phase advances from 0 to 1 and
+        # then freezes. Freezing at 1 gives the policy an explicit final
+        # stand-still period instead of immediately restarting the cycle.
+        self._dance_phase = torch.clamp(
+            self._dance_phase + dt / self._period,
+            max=1.0,
+        )
 
-    right_move = (phase >= 0.50) & (phase < 0.75)
-    t_right = (phase - 0.50) / 0.25
-    y_ref = torch.where(right_move, amplitude * t_right, y_ref)
+        seg = (self._dance_phase * 4.0).floor().long() % 4
+        sign = torch.where((seg == 0) | (seg == 3), -1.0, 1.0)
+        vy_ref = torch.where(self._dance_phase >= 1.0, 0.0, sign * self._lateral_speed)
 
-    ret_right = (phase >= 0.75) & (phase < 1.00)
-    t_ret_right = (phase - 0.75) / 0.25
-    y_ref = torch.where(ret_right, amplitude - amplitude * t_ret_right, y_ref)
+        # vx=0 keeps this a lateral-only command. vtheta=0 makes the base
+        # track_angular_velocity reward resist trunk yaw drift.
+        self.vel_command_b[:, 0] = 0.0
+        self.vel_command_b[:, 1] = vy_ref
+        self.vel_command_b[:, 2] = 0.0
 
-    return y_ref
+    def reset(self, env_ids: torch.Tensor | None) -> dict:
+        if env_ids is not None and len(env_ids) > 0:
+            if self._randomize_phase:
+                self._dance_phase[env_ids] = torch.rand(len(env_ids), device=self.device)
+            else:
+                self._dance_phase[env_ids] = 0.0
+        return {}
+
+    def _resample_command(self, env_ids: torch.Tensor) -> None:
+        pass  # Phase is continuous; no resampling needed
+
+    def _update_command(self) -> None:
+        pass  # Updated in compute()
+
+    def _update_metrics(self) -> None:
+        pass  # No velocity tracking metrics for dance
+
+
+@_dataclass(kw_only=True)
+class DanceLateralVelocityCommandCfg(UniformVelocityCommandCfg):
+    class_type: type = DanceLateralVelocityCommand
+    period: float = 8.0
+    lateral_speed: float = 0.05
+    randomize_phase: bool = False
+
+    def build(self, env: ManagerBasedRlEnv) -> "DanceLateralVelocityCommand":
+        return DanceLateralVelocityCommand(self, env)
 
 def dance_head_yaw_reference(
     phase: torch.Tensor,
@@ -5087,6 +5111,7 @@ def dance_head_yaw_reference(
 
     left_segments = (seg == 0) | (seg == 3)
     head_yaw_ref = torch.where(left_segments, -amplitude, amplitude)
+    head_yaw_ref = torch.where(phase >= 1.0, 0.0, head_yaw_ref)
 
     return head_yaw_ref
 
@@ -5161,77 +5186,104 @@ def dance_heading_tracking(
 
     return torch.exp(-(yaw_error / std) ** 2)
 
-def dance_lateral_velocity_tracking(
-    env: ManagerBasedRlEnv,
-    command_name: str = "twist",
-    amplitude: float = 0.15,
-    period_s: float = 12.0,
-    std: float = 0.05,
-    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
-) -> torch.Tensor:
-    """Reward body-y velocity for matching the current lateral target speed."""
-    asset: Entity = env.scene[asset_cfg.name]
-
-    phase = dance_phase_from_command(env, command_name)
-
-    seg = (phase * 4.0).floor().long() % 4
-    slope_per_phase = torch.where(
-        (seg == 0) | (seg == 3),
-        -4.0 * amplitude,
-        4.0 * amplitude,
-    )
-    target_vy = slope_per_phase / period_s
-
-    body_y_local = torch.zeros_like(asset.data.root_link_vel_w)
-    body_y_local[:, 1] = 1.0
-    body_y_world = quat_apply(env._dance_origin_quat, body_y_local)
-
-    actual_vy = (asset.data.root_link_vel_w * body_y_world).sum(dim=-1)
-
-    return torch.exp(-((actual_vy - target_vy) / std) ** 2)
 
 def dance_lateral_tracking(
     env: ManagerBasedRlEnv,
     command_name: str = "twist",
-    amplitude: float = 0.15,
-    std: float = 0.04,
+    amplitude: float = 0.10,
+    period_s: float = 8.0,
+    std: float = 0.08,
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
-    """Track lateral progress along the body y-axis defined at dance start.
+    """Track lateral position along the body-y axis defined at dance start.
 
-    This is deliberately body-relative, not world-relative: no matter where
-    the walking policy drops the robot, the dance reference starts from that
-    pose and measures progress along the robot's own starting y direction.
+    This is body-relative and position-based, while the base velocity reward
+    handles the current lateral speed. The combination keeps both the distance
+    and the gait correct without hard-coding a joint trajectory.
     """
     asset: Entity = env.scene[asset_cfg.name]
 
-    phase = dance_phase_from_command(env, command_name)
-    y_ref = dance_lateral_reference(phase, amplitude)
+    phase = torch.clamp(env.episode_length_buf * env.step_dt / period_s, max=1.0)
+    y_ref = _dance_lateral_reference(phase, amplitude)
 
-    # World displacement since the dance episode started.
     delta_world = asset.data.root_link_pos_w - env._dance_origin_pos
 
-    # Body-local y axis at dance start, rotated into the world frame.
     body_y_local = torch.zeros_like(delta_world)
     body_y_local[:, 1] = 1.0
     body_y_world = quat_apply(env._dance_origin_quat, body_y_local)
 
-    # Signed lateral displacement along the robot's starting body y-axis.
     actual_body_y = (delta_world * body_y_world).sum(dim=-1)
 
     return torch.exp(-((actual_body_y - y_ref) / std) ** 2)
+
+
+def _dance_lateral_reference(
+    phase: torch.Tensor,
+    amplitude: float,
+) -> torch.Tensor:
+    """Return the piecewise-linear lateral position reference for one cycle."""
+    y_ref = torch.zeros_like(phase)
+
+    left_move = phase < 0.25
+    y_ref = torch.where(left_move, -amplitude * (phase / 0.25), y_ref)
+
+    ret_left = (phase >= 0.25) & (phase < 0.50)
+    y_ref = torch.where(
+        ret_left,
+        -amplitude + amplitude * ((phase - 0.25) / 0.25),
+        y_ref,
+    )
+
+    right_move = (phase >= 0.50) & (phase < 0.75)
+    y_ref = torch.where(
+        right_move,
+        amplitude * ((phase - 0.50) / 0.25),
+        y_ref,
+    )
+
+    ret_right = (phase >= 0.75) & (phase < 1.00)
+    y_ref = torch.where(
+        ret_right,
+        amplitude - amplitude * ((phase - 0.75) / 0.25),
+        y_ref,
+    )
+
+    return y_ref
+
+
+def dance_forward_tracking(
+    env: ManagerBasedRlEnv,
+    command_name: str = "twist",
+    std: float = 0.03,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Keep body-x displacement near zero during the lateral dance."""
+    asset: Entity = env.scene[asset_cfg.name]
+
+    delta_world = asset.data.root_link_pos_w - env._dance_origin_pos
+
+    body_x_local = torch.zeros_like(delta_world)
+    body_x_local[:, 0] = 1.0
+    body_x_world = quat_apply(env._dance_origin_quat, body_x_local)
+
+    actual_body_x = (delta_world * body_x_world).sum(dim=-1)
+
+    return torch.exp(-(actual_body_x / std) ** 2)
 
 def dance_head_yaw_tracking(
     env: ManagerBasedRlEnv,
     command_name: str = "twist",
     amplitude: float = 0.5,
+    period_s: float = 8.0,
     std: float = 0.25,
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
     """Reward head_yaw for matching the current walking direction."""
     asset: Entity = env.scene[asset_cfg.name]
 
-    phase = dance_phase_from_command(env, command_name)
+    # The lateral velocity command does not encode phase directly, but every
+    # episode starts at phase 0 and advances in real time.
+    phase = torch.clamp(env.episode_length_buf * env.step_dt / period_s, max=1.0)
     head_yaw_ref = dance_head_yaw_reference(phase, amplitude)
     head_yaw_ids, _ = asset.find_joints_by_actuator_names([r".*head_yaw.*"])
 
@@ -5241,6 +5293,25 @@ def dance_head_yaw_tracking(
     actual_head_yaw = asset.data.joint_pos[:, head_yaw_ids[0]]
 
     return torch.exp(-((actual_head_yaw - head_yaw_ref) / std) ** 2)
+
+def dance_head_pitch_tracking(
+    env: ManagerBasedRlEnv,
+    command_name: str = "twist",
+    std: float = 0.15,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Keep head_pitch close to its HOME value during the dance."""
+    asset: Entity = env.scene[asset_cfg.name]
+
+    head_pitch_ids, _ = asset.find_joints_by_actuator_names([r".*head_pitch.*"])
+
+    if len(head_pitch_ids) != 1:
+        raise RuntimeError("Expected exactly one head_pitch joint.")
+
+    actual = asset.data.joint_pos[:, head_pitch_ids[0]]
+    default = asset.data.default_joint_pos[:, head_pitch_ids[0]]
+
+    return torch.exp(-((actual - default) / std) ** 2)
 
 
 # --------------------------------------------------------------------------- #
