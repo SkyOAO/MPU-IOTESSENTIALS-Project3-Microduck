@@ -5236,12 +5236,12 @@ def dance_lateral_foot_pattern_tracking(
     # Left move: left foot swings with vy_ref, right foot stays at zero speed.
     left_swing = torch.exp(-((foot_vy[:, 0] - vy_ref) / std) ** 2)
     right_stance = torch.exp(-(foot_vy[:, 1] / std) ** 2)
-    left_score = left_swing * left_air * right_stance * right_ground
+    left_score = left_swing * right_stance * (0.2 + 0.8 * left_air * right_ground)
 
     # Right move: mirrored.
     right_swing = torch.exp(-((foot_vy[:, 1] - vy_ref) / std) ** 2)
     left_stance = torch.exp(-(foot_vy[:, 0] / std) ** 2)
-    right_score = right_swing * right_air * left_stance * left_ground
+    right_score = right_swing * left_stance * (0.2 + 0.8 * right_air * left_ground)
 
     moving = (vy_ref != 0.0).float()
     left_mask = (vy_ref < 0.0).float()

@@ -318,14 +318,14 @@ def make_microduck_dance_env_cfg(
 
     cfg.rewards["dance_forward_tracking"] = RewardTermCfg(
         func=microduck_mdp.dance_forward_tracking,
-        weight=3.0,
-        params={"std": 0.02},
+        weight=1.0,
+        params={"std": 0.03},
     )
 
     cfg.rewards["dance_heading_tracking"] = RewardTermCfg(
         func=microduck_mdp.dance_heading_tracking,
-        weight=2.5,
-        params={"std": 0.15},
+        weight=1.5,
+        params={"std": 0.20},
     )
 
     cfg.rewards["dance_head_yaw_tracking"] = RewardTermCfg(
@@ -347,7 +347,7 @@ def make_microduck_dance_env_cfg(
 
     cfg.rewards["dance_lateral_foot_pattern_tracking"] = RewardTermCfg(
         func=microduck_mdp.dance_lateral_foot_pattern_tracking,
-        weight=1.0,
+        weight=0.3,
         params={
             "command_name": "twist",
             "period_s": DANCE_PERIOD_S,
@@ -361,7 +361,7 @@ def make_microduck_dance_env_cfg(
 
     cfg.rewards["dance_yaw_rate_penalty"] = RewardTermCfg(
         func=microduck_mdp.dance_yaw_rate_penalty,
-        weight=-0.5,
+        weight=-0.2,
     )
 
     # Keep the velocity-template walking rewards. The new twist command is
