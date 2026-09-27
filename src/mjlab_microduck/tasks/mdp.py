@@ -5186,6 +5186,81 @@ def dance_heading_tracking(
 
     return torch.exp(-(yaw_error / std) ** 2)
 
+def dance_lateral_foot_pattern_tracking(
+    env: ManagerBasedRlEnv,
+    command_name: str = "twist",
+    period_s: float = 8.0,
+    contact_sensor_name: str = "feet_ground_contact",
+    std: float = 0.05,
+    foot_cfg: SceneEntityCfg = SceneEntityCfg(
+        "robot", site_names=("left_foot", "right_foot")
+    ),
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Reward the correct stance/swing foot pattern for lateral stepping.
+
+    Moving left:  left foot is the swing foot and moves left;
+                  right foot is the stance foot and stays planted.
+    Moving right: mirrored.
+    """
+    asset: Entity = env.scene[asset_cfg.name]
+
+    phase = torch.clamp(
+        env.episode_length_buf * env.step_dt / period_s,
+        max=1.0,
+    )
+
+    seg = (phase * 4.0).floor().long() % 4
+    vy_ref = torch.where((seg == 0) | (seg == 3), -1.0, 1.0)
+    vy_ref = torch.where(phase >= 1.0, 0.0, vy_ref)
+
+    # Foot linear velocity in world frame, projected onto the body-y axis that
+    # existed at dance start.
+    foot_vel_w = asset.data.site_lin_vel_w[:, foot_cfg.site_ids, :3]
+    delta_world = asset.data.root_link_pos_w - env._dance_origin_pos
+
+    body_y_local = torch.zeros_like(delta_world)
+    body_y_local[:, 1] = 1.0
+    body_y_world = quat_apply(env._dance_origin_quat, body_y_local)
+
+    foot_vy = (foot_vel_w * body_y_world.unsqueeze(1)).sum(dim=-1)
+
+    contact = env.scene[contact_sensor_name]
+    found = contact.data.found
+
+    left_air = (found[:, 0] == 0).float()
+    right_air = (found[:, 1] == 0).float()
+    left_ground = (found[:, 0] > 0).float()
+    right_ground = (found[:, 1] > 0).float()
+
+    # Left move: left foot swings with vy_ref, right foot stays at zero speed.
+    left_swing = torch.exp(-((foot_vy[:, 0] - vy_ref) / std) ** 2)
+    right_stance = torch.exp(-(foot_vy[:, 1] / std) ** 2)
+    left_score = left_swing * left_air * right_stance * right_ground
+
+    # Right move: mirrored.
+    right_swing = torch.exp(-((foot_vy[:, 1] - vy_ref) / std) ** 2)
+    left_stance = torch.exp(-(foot_vy[:, 0] / std) ** 2)
+    right_score = right_swing * right_air * left_stance * left_ground
+
+    moving = (vy_ref != 0.0).float()
+    left_mask = (vy_ref < 0.0).float()
+    right_mask = (vy_ref > 0.0).float()
+
+    return left_mask * left_score + right_mask * right_score + (1.0 - moving)
+
+def dance_yaw_rate_penalty(
+    env: ManagerBasedRlEnv,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Penalize trunk yaw-rate directly.
+
+    track_angular_velocity and heading tracking are useful, but the observed
+    left-step/right-step yaw oscillation needs a direct yaw-rate cost.
+    """
+    asset: Entity = env.scene[asset_cfg.name]
+    yaw_rate = asset.data.root_link_ang_vel_b[:, 2]
+    return yaw_rate ** 2
 
 def dance_lateral_tracking(
     env: ManagerBasedRlEnv,
