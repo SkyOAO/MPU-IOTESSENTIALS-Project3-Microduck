@@ -318,14 +318,14 @@ def make_microduck_dance_env_cfg(
 
     cfg.rewards["dance_forward_tracking"] = RewardTermCfg(
         func=microduck_mdp.dance_forward_tracking,
-        weight=1.0,
-        params={"std": 0.03},
+        weight=2.0,
+        params={"std": 0.02},
     )
 
     cfg.rewards["dance_heading_tracking"] = RewardTermCfg(
         func=microduck_mdp.dance_heading_tracking,
-        weight=1.5,
-        params={"std": 0.20},
+        weight=2.0,
+        params={"std": 0.18},
     )
 
     cfg.rewards["dance_head_yaw_tracking"] = RewardTermCfg(
@@ -347,7 +347,7 @@ def make_microduck_dance_env_cfg(
 
     cfg.rewards["dance_lateral_foot_pattern_tracking"] = RewardTermCfg(
         func=microduck_mdp.dance_lateral_foot_pattern_tracking,
-        weight=0.3,
+        weight=0.8,
         params={
             "command_name": "twist",
             "period_s": DANCE_PERIOD_S,
@@ -373,7 +373,7 @@ def make_microduck_dance_env_cfg(
     cfg.rewards["track_angular_velocity"].weight = 2.0
     cfg.rewards["track_angular_velocity"].params["std"] = math.sqrt(0.5)
 
-    cfg.rewards["air_time"].weight = 1.5
+    cfg.rewards["air_time"].weight = 2.5
     cfg.rewards["air_time"].params["command_threshold"] = 0.01
     cfg.rewards["air_time"].params["threshold_min"] = 0.125
     cfg.rewards["air_time"].params["threshold_max"] = 0.300
@@ -384,7 +384,7 @@ def make_microduck_dance_env_cfg(
     cfg.rewards["foot_swing_height"].params["command_threshold"] = 0.01
     cfg.rewards["foot_swing_height"].params["target_height"] = 0.02
 
-    cfg.rewards["foot_slip"].weight = -0.1
+    cfg.rewards["foot_slip"].weight = -0.4
     cfg.rewards["foot_slip"].params["command_threshold"] = 0.01
 
     cfg.rewards["body_ang_vel"].weight = -0.05
