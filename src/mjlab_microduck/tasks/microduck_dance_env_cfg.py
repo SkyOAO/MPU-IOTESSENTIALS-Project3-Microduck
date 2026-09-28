@@ -68,7 +68,7 @@ BASE_ORIENTATION_MAX_PITCH_DEG = 10.0  # ±10° forward/backward tilt at episode
 BASE_ORIENTATION_MAX_ROLL_DEG = 5.0  # ±5° side-to-side tilt at episode start
 
 # Dance timing and geometry
-DANCE_PERIOD_S = 8.0          # one full left-right-left cycle
+DANCE_PERIOD_S = 10.0          # one full left-right-left cycle
 DANCE_LATERAL_AMP = 0.10       # lateral half-range in metres
 DANCE_HEAD_YAW_AMP = 0.5       # head yaw target amplitude in radians
 DANCE_LATERAL_SPEED = DANCE_LATERAL_AMP / (DANCE_PERIOD_S / 4.0)
@@ -307,12 +307,12 @@ def make_microduck_dance_env_cfg(
 
     cfg.rewards["dance_lateral_tracking"] = RewardTermCfg(
         func=microduck_mdp.dance_lateral_tracking,
-        weight=2.0,
+        weight=4.0,
         params={
             "command_name": "twist",
             "amplitude": DANCE_LATERAL_AMP,
             "period_s": DANCE_PERIOD_S,
-            "std": 0.08,
+            "std": 0.06,
         },
     )
 
@@ -373,7 +373,7 @@ def make_microduck_dance_env_cfg(
     cfg.rewards["track_angular_velocity"].weight = 2.0
     cfg.rewards["track_angular_velocity"].params["std"] = math.sqrt(0.5)
 
-    cfg.rewards["air_time"].weight = 3.0
+    cfg.rewards["air_time"].weight = 1.5
     cfg.rewards["air_time"].params["command_threshold"] = 0.01
     cfg.rewards["air_time"].params["threshold_min"] = 0.125
     cfg.rewards["air_time"].params["threshold_max"] = 0.300
