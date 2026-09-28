@@ -70,7 +70,7 @@ BASE_ORIENTATION_MAX_ROLL_DEG = 5.0  # ±5° side-to-side tilt at episode start
 # Dance timing and geometry
 DANCE_PERIOD_S = 10.0          # one full left-right-left cycle
 DANCE_LATERAL_AMP = 0.10       # lateral half-range in metres
-DANCE_HEAD_YAW_AMP = 0.5       # head yaw target amplitude in radians
+DANCE_HEAD_YAW_AMP = 0.35       # head yaw target amplitude in radians
 DANCE_LATERAL_SPEED = DANCE_LATERAL_AMP / (DANCE_PERIOD_S / 4.0)
 EPISODE_LENGTH_S = DANCE_PERIOD_S + 2.0
 
@@ -318,24 +318,24 @@ def make_microduck_dance_env_cfg(
 
     cfg.rewards["dance_forward_tracking"] = RewardTermCfg(
         func=microduck_mdp.dance_forward_tracking,
-        weight=0.5,
+        weight=1.0,
         params={"std": 0.03},
     )
 
     cfg.rewards["dance_heading_tracking"] = RewardTermCfg(
         func=microduck_mdp.dance_heading_tracking,
-        weight=0.8,
-        params={"std": 0.20},
+        weight=1.5,
+        params={"std": 0.15},
     )
 
     cfg.rewards["dance_head_yaw_tracking"] = RewardTermCfg(
         func=microduck_mdp.dance_head_yaw_tracking,
-        weight=0.5,
+        weight=0.8,
         params={
             "command_name": "twist",
             "amplitude": DANCE_HEAD_YAW_AMP,
             "period_s": DANCE_PERIOD_S,
-            "std": 0.25,
+            "std": 0.20,
         },
     )
 
@@ -361,7 +361,7 @@ def make_microduck_dance_env_cfg(
 
     cfg.rewards["dance_yaw_rate_penalty"] = RewardTermCfg(
         func=microduck_mdp.dance_yaw_rate_penalty,
-        weight=0.0,
+        weight=-0.3,
     )
 
     # Keep the velocity-template walking rewards. The new twist command is
