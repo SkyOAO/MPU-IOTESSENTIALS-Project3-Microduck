@@ -345,6 +345,12 @@ def make_microduck_dance_env_cfg(
         params={"std": 0.10},
     )
 
+    cfg.rewards["dance_neck_pitch_tracking"] = RewardTermCfg(
+        func=microduck_mdp.dance_neck_pitch_tracking,
+        weight=1.0,
+        params={"std": 0.15},
+    )
+
     cfg.rewards["dance_lateral_foot_pattern_tracking"] = RewardTermCfg(
         func=microduck_mdp.dance_lateral_foot_pattern_tracking,
         weight=0.0,
