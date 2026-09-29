@@ -316,6 +316,16 @@ def make_microduck_dance_env_cfg(
         },
     )
 
+    cfg.rewards["dance_lateral_l1_penalty"] = RewardTermCfg(
+        func=microduck_mdp.dance_lateral_l1_penalty,
+        weight=1.5,
+        params={
+            "command_name": "twist",
+            "amplitude": DANCE_LATERAL_AMP,
+            "period_s": DANCE_PERIOD_S,
+        },
+    )
+
     cfg.rewards["dance_forward_tracking"] = RewardTermCfg(
         func=microduck_mdp.dance_forward_tracking,
         weight=1.5,
@@ -326,6 +336,11 @@ def make_microduck_dance_env_cfg(
         func=microduck_mdp.dance_heading_tracking,
         weight=2.5,
         params={"std": 0.12},
+    )
+
+    cfg.rewards["dance_heading_l1_penalty"] = RewardTermCfg(
+        func=microduck_mdp.dance_heading_l1_penalty,
+        weight=1.5,
     )
 
     cfg.rewards["dance_head_yaw_tracking"] = RewardTermCfg(

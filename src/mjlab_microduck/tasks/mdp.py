@@ -5186,6 +5186,25 @@ def dance_heading_tracking(
 
     return torch.exp(-(yaw_error / std) ** 2)
 
+
+def dance_heading_l1_penalty(
+    env: ManagerBasedRlEnv,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Linear penalty on body yaw error."""
+    asset: Entity = env.scene[asset_cfg.name]
+
+    q = asset.data.root_link_quat_w
+    w, x, y, z = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
+    current_yaw = torch.atan2(
+        2.0 * (w * z + x * y),
+        1.0 - 2.0 * (y * y + z * z),
+    )
+
+    yaw_error = wrap_to_pi(current_yaw - env._dance_origin_yaw)
+    return -torch.abs(yaw_error)
+
+
 def dance_lateral_foot_pattern_tracking(
     env: ManagerBasedRlEnv,
     command_name: str = "twist",
@@ -5290,6 +5309,30 @@ def dance_lateral_tracking(
     actual_body_y = (delta_world * body_y_world).sum(dim=-1)
 
     return torch.exp(-((actual_body_y - y_ref) / std) ** 2)
+
+
+def dance_lateral_l1_penalty(
+    env: ManagerBasedRlEnv,
+    command_name: str = "twist",
+    amplitude: float = 0.10,
+    period_s: float = 8.0,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Linear penalty on lateral position error."""
+    asset: Entity = env.scene[asset_cfg.name]
+
+    phase = torch.clamp(env.episode_length_buf * env.step_dt / period_s, max=1.0)
+    y_ref = _dance_lateral_reference(phase, amplitude)
+
+    delta_world = asset.data.root_link_pos_w - env._dance_origin_pos
+
+    body_y_local = torch.zeros_like(delta_world)
+    body_y_local[:, 1] = 1.0
+    body_y_world = quat_apply(env._dance_origin_quat, body_y_local)
+
+    actual_body_y = (delta_world * body_y_world).sum(dim=-1)
+
+    return -torch.abs(actual_body_y - y_ref)
 
 
 def _dance_lateral_reference(
