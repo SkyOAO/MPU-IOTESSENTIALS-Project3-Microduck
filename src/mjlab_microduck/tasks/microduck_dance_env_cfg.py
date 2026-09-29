@@ -283,7 +283,7 @@ def make_microduck_dance_env_cfg(
     # 2.0 / std²=0.05 it costs ~0.19/step: enough gradient to hold the trunk
     # level in steady gait while transient lean (push recovery, accel) stays
     # affordable.
-    cfg.rewards["upright"].weight = 2.0
+    cfg.rewards["upright"].weight = 3.0
     cfg.rewards["upright"].params["std"] = math.sqrt(0.05)
 
     # foot_clearance and foot_slip still read foot sites from asset_cfg.
@@ -340,7 +340,7 @@ def make_microduck_dance_env_cfg(
 
     cfg.rewards["dance_heading_l1_penalty"] = RewardTermCfg(
         func=microduck_mdp.dance_heading_l1_penalty,
-        weight=1.5,
+        weight=2.5,
     )
 
     cfg.rewards["dance_head_yaw_tracking"] = RewardTermCfg(
@@ -388,7 +388,7 @@ def make_microduck_dance_env_cfg(
 
     cfg.rewards["dance_yaw_rate_penalty"] = RewardTermCfg(
         func=microduck_mdp.dance_yaw_rate_penalty,
-        weight=-0.7,
+        weight=-1.0,
     )
 
     # Keep the velocity-template walking rewards. The new twist command is
