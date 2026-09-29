@@ -5409,6 +5409,26 @@ def dance_neck_pitch_tracking(
     return torch.exp(-((actual - default) / std) ** 2)
 
 
+def dance_head_roll_tracking(
+    env: ManagerBasedRlEnv,
+    command_name: str = "twist",
+    std: float = 0.10,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Keep head_roll close to HOME so the head turns instead of tilting."""
+    asset: Entity = env.scene[asset_cfg.name]
+
+    head_roll_ids, _ = asset.find_joints_by_actuator_names([r".*head_roll.*"])
+
+    if len(head_roll_ids) != 1:
+        raise RuntimeError("Expected exactly one head_roll joint.")
+
+    actual = asset.data.joint_pos[:, head_roll_ids[0]]
+    default = asset.data.default_joint_pos[:, head_roll_ids[0]]
+
+    return torch.exp(-((actual - default) / std) ** 2)
+
+
 # --------------------------------------------------------------------------- #
 # Unified pose command machinery                                               #
 # --------------------------------------------------------------------------- #
