@@ -345,7 +345,7 @@ def make_microduck_dance_env_cfg(
     cfg.rewards["track_linear_velocity"].weight = 2.0
     cfg.rewards["track_linear_velocity"].params["std"] = math.sqrt(0.1)
 
-    cfg.rewards["track_angular_velocity"].weight = 2.0
+    cfg.rewards["track_angular_velocity"].weight = 5.0
     cfg.rewards["track_angular_velocity"].params["std"] = math.sqrt(0.5)
 
     cfg.rewards["air_time"].weight = 3.0
