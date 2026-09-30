@@ -1,7 +1,29 @@
-"""Microduck lateral-patrol dance task.
+"""Microduck in-place turn dance task.
 
-Episodic phase policy: the robot starts standing, walks left and right along
-its own body-y axis, and turns its head toward the current motion direction.
+Episodic policy: the robot starts standing, turns exactly one full revolution
+CLOCKWISE in place (ω_z < 0), and settles back to a stand on the spot it started
+from. It is the first half of the deployment combo "turn one revolution, then
+forward roll": finishing standing on the starting position and heading is what
+lets the existing roulade policy take over (that policy was trained to start
+rolling from a standstill).
+
+Timing (one cycle per episode, `EPISODE_LENGTH_S = DANCE_PERIOD_S + 2`):
+    [0.0,  8.5) s   trapezoid turn — ramp 0.5 s, hold 0.785 rad/s, ramp 0.5 s,
+                    so the commanded rotation integrates to exactly 2π
+    [8.5, 10.5) s   settle — ω_ref = 0, stand still
+    [10.5, 12.5) s  episode tail — still 0, trains the stop
+
+The revolution is MEASURED, not assumed: `dance_turn_angle_tracking` reads a
+per-env accumulator of the (support- and upright-gated) trunk yaw and compares
+it against the commanded rotation. The old two-turn dance only rewarded the
+instantaneous yaw rate, so nothing pinned the rotation actually achieved — its
+logged rate tracking averaged exp(−err²/0.5) ≈ 0.08 (RMS |Δω| ≈ 1.1 rad/s
+against a 0.785 rad/s command).
+
+Head: the four head joints are held near HOME (the head keeps facing forward
+while the body turns). They are NOT a balance mechanism — measured on
+robot_walk.xml the whole head workspace moves the body CoM by only ±3.8 mm
+laterally — so nothing here asks the head to stabilise the turn.
 """
 
 import math
@@ -67,11 +89,21 @@ ENCODER_BIAS_RANGE = (-0.015, 0.015)  # ±0.86° per-joint encoder offset (const
 BASE_ORIENTATION_MAX_PITCH_DEG = 10.0  # ±10° forward/backward tilt at episode start
 BASE_ORIENTATION_MAX_ROLL_DEG = 5.0  # ±5° side-to-side tilt at episode start
 
-# Dance timing and geometry
-DANCE_PERIOD_S = 16.0          # full two-turn cycle length
-DANCE_TURN_SPEED = 4.0 * math.pi / DANCE_PERIOD_S
-DANCE_HEAD_YAW_AMP = 0.0       # keep head facing forward
-EPISODE_LENGTH_S = DANCE_PERIOD_S + 2.0
+# Dance timing and geometry — one clockwise revolution, then settle
+DANCE_TURN_ANGLE = 2.0 * math.pi            # exactly one full revolution
+# Speed deliberately unchanged (0.785 rad/s = 8 s per revolution): it is the rate
+# the existing dance policy already tracks, and completion matters more than
+# speed. Raise it only after a full-revolution cycle is reliable.
+DANCE_TURN_SPEED = 4.0 * math.pi / 16.0
+DANCE_RAMP_S = 0.5                          # trapezoid ramp at each end of the turn
+DANCE_SETTLE_S = 2.0                        # stand-still segment (hand-off window)
+# Derived so the commanded rotation integrates to exactly one revolution.
+DANCE_TURN_S = DANCE_TURN_ANGLE / DANCE_TURN_SPEED + DANCE_RAMP_S   # 8.5 s
+DANCE_PERIOD_S = DANCE_TURN_S + DANCE_SETTLE_S                      # 10.5 s
+# ω_z convention (x forward, y left, z up): negative = clockwise. Must match
+# microduck_mdp.DANCE_TURN_SIGN_CW (asserted in tests/test_dance_cfg.py).
+DANCE_TURN_SIGN = -1.0
+EPISODE_LENGTH_S = DANCE_PERIOD_S + 2.0                             # 12.5 s
 
 import mujoco as _mujoco
 import mjlab.terrains as terrain_gen
@@ -304,21 +336,48 @@ def make_microduck_dance_env_cfg(
         params={"sensor_name": self_collision_cfg.name},
     )
 
-    cfg.rewards["dance_forward_tracking"] = RewardTermCfg(
-        func=microduck_mdp.dance_forward_tracking,
-        weight=1.0,
+    # --- In-place turn task terms -------------------------------------------
+    # Absolute-rotation tracking is the primary signal: the old dance only
+    # rewarded the instantaneous yaw RATE, so nothing pinned the rotation
+    # actually achieved (logged rate tracking averaged exp(−err²/0.5) ≈ 0.08).
+    # This term is the only one that can express "one full revolution and back
+    # to the starting heading", and because its target stops at ±2π it also
+    # trains the settle segment ("stop, and stop on the target").
+    cfg.rewards["dance_turn_angle_tracking"] = RewardTermCfg(
+        func=microduck_mdp.dance_turn_angle_tracking,
+        weight=3.0,
+        params={"command_name": "twist", "std": 0.20},
+    )
+
+    # L1 bootstrap on the same error: at spawn the robot is a whole revolution
+    # off, where the Gaussian is numerically flat — without this "stand still"
+    # has no gradient. Returns ≤ 0 → POSITIVE weight.
+    cfg.rewards["dance_turn_angle_l1"] = RewardTermCfg(
+        func=microduck_mdp.dance_turn_angle_l1,
+        weight=0.3,
+        params={"command_name": "twist"},
+    )
+
+    # Turn without translating: the roulade hand-off expects the robot standing
+    # exactly where it started.
+    cfg.rewards["dance_stay_in_place"] = RewardTermCfg(
+        func=microduck_mdp.dance_stay_in_place,
+        weight=1.5,
         params={"std": 0.03},
+    )
+
+    # L1 companion (≤ 0 → POSITIVE weight): keeps pulling back once the Gaussian
+    # above has saturated.
+    cfg.rewards["dance_stay_in_place_l1"] = RewardTermCfg(
+        func=microduck_mdp.dance_stay_in_place_l1,
+        weight=0.5,
+        params={},
     )
 
     cfg.rewards["dance_head_yaw_tracking"] = RewardTermCfg(
         func=microduck_mdp.dance_head_yaw_tracking,
         weight=1.0,
-        params={
-            "command_name": "twist",
-            "amplitude": DANCE_HEAD_YAW_AMP,
-            "period_s": DANCE_PERIOD_S,
-            "std": 0.15,
-        },
+        params={"std": 0.15},
     )
 
     cfg.rewards["dance_head_pitch_tracking"] = RewardTermCfg(
@@ -339,9 +398,10 @@ def make_microduck_dance_env_cfg(
         params={"std": 0.10},
     )
 
-    # Keep the velocity-template walking rewards. The new twist command is
-    # [0, 0, angular_velocity_ref], so track_linear_velocity keeps the robot
-    # in place and track_angular_velocity drives the two turns.
+    # Keep the velocity-template walking rewards. The twist command is still
+    # [0, 0, angular_velocity_ref]: track_linear_velocity keeps the robot from
+    # translating, and track_angular_velocity stays as a cheap per-step
+    # companion to the rotation closed loop above.
     cfg.rewards["track_linear_velocity"].weight = 2.0
     cfg.rewards["track_linear_velocity"].params["std"] = math.sqrt(0.1)
 
@@ -349,18 +409,22 @@ def make_microduck_dance_env_cfg(
     cfg.rewards["track_angular_velocity"].params["std"] = math.sqrt(0.5)
 
     cfg.rewards["air_time"].weight = 3.0
-    cfg.rewards["air_time"].params["command_threshold"] = 0.0
     cfg.rewards["air_time"].params["threshold_min"] = 0.125
     cfg.rewards["air_time"].params["threshold_max"] = 0.300
 
-    cfg.rewards["foot_clearance"].params["command_threshold"] = 0.0
     cfg.rewards["foot_clearance"].params["target_height"] = 0.02
 
-    cfg.rewards["foot_swing_height"].params["command_threshold"] = 0.0
     cfg.rewards["foot_swing_height"].params["target_height"] = 0.02
 
+    # Gate the gait-shaping terms on the commanded yaw rate instead of leaving
+    # them permanently on (they used to be pinned at command_threshold = 0.0):
+    # |ω| = 0.785 while turning and exactly 0 through the settle segment, so a
+    # 0.1 threshold stops them paying the robot to march in place after the
+    # revolution is finished.
+    for _term in ("air_time", "foot_clearance", "foot_swing_height", "foot_slip"):
+        cfg.rewards[_term].params["command_threshold"] = 0.1
+
     cfg.rewards["foot_slip"].weight = -0.4
-    cfg.rewards["foot_slip"].params["command_threshold"] = 0.0
 
     cfg.rewards["body_ang_vel"].weight = -0.05
     cfg.rewards["angular_momentum"].weight = -0.02
@@ -652,7 +716,7 @@ def make_microduck_dance_env_cfg(
     else:
         cfg.events.pop("encoder_bias", None)
 
-    # Replace the base velocity command with a fixed in-place turn phase.
+    # Replace the base velocity command with the one-revolution turn cycle.
     # The twist slot stays 3D but now means [vx=0, vy=0, angular_velocity_ref].
     command = deepcopy(cfg.commands["twist"])
     command.rel_standing_envs = 0.0
@@ -665,8 +729,11 @@ def make_microduck_dance_env_cfg(
         **{
             **command_kwargs,
             "class_type": microduck_mdp.DanceTurnVelocityCommand,
-            "period": DANCE_PERIOD_S,
             "turn_speed": DANCE_TURN_SPEED,
+            "turn_angle": DANCE_TURN_ANGLE,
+            "ramp_s": DANCE_RAMP_S,
+            "settle_s": DANCE_SETTLE_S,
+            "turn_sign": DANCE_TURN_SIGN,
             "randomize_phase": False,
         }
     )
