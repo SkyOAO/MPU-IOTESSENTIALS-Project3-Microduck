@@ -5079,6 +5079,12 @@ def _bounce_trunk_roll(asset: Entity) -> torch.Tensor:
     return torch.atan2(-g[:, 1], -g[:, 2])
 
 
+def _bounce_yaw_from_quat(q: torch.Tensor) -> torch.Tensor:
+    """Trunk yaw (rad) from a (N, 4) wxyz quaternion. Positive = counter-clockwise."""
+    w, x, y, z = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
+    return torch.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
+
+
 def bounce_reset_origin(
     env: ManagerBasedRlEnv,
     env_ids: torch.Tensor,
@@ -5101,11 +5107,15 @@ def bounce_reset_origin(
         env._bounce_origin_yaw = torch.zeros(env.num_envs, device=env.device, dtype=dtype)
 
     env._bounce_origin_pos[env_ids] = asset.data.root_link_pos_w[env_ids]
-    q = asset.data.root_link_quat_w[env_ids]
-    w, x, y, z = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
-    env._bounce_origin_yaw[env_ids] = torch.atan2(
-        2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z)
+    env._bounce_origin_yaw[env_ids] = _bounce_yaw_from_quat(
+        asset.data.root_link_quat_w[env_ids]
     )
+
+    # Restart the signed yaw accumulators that feed the rotation metrics.
+    _bounce_yaw_state(env)
+    env._bounce_yaw_net[env_ids] = 0.0
+    env._bounce_yaw_path[env_ids] = 0.0
+    env._bounce_yaw_last[env_ids] = env._bounce_origin_yaw[env_ids]
 
 
 def _bounce_drift(
@@ -5115,6 +5125,40 @@ def _bounce_drift(
     """Horizontal distance (m) of the trunk from its bounce-start position."""
     delta = asset.data.root_link_pos_w - env._bounce_origin_pos
     return torch.sqrt(delta[:, 0] ** 2 + delta[:, 1] ** 2)
+
+
+def _bounce_yaw_state(env: ManagerBasedRlEnv) -> torch.Tensor:
+    """Per-env signed-yaw accumulators (net turn and total turn path)."""
+    if not hasattr(env, "_bounce_yaw_net"):
+        zeros = torch.zeros(env.num_envs, device=env.device)
+        env._bounce_yaw_net = zeros.clone()   # signed, unwrapped
+        env._bounce_yaw_path = zeros.clone()  # ∫|dyaw|, always grows
+        env._bounce_yaw_last = zeros.clone()
+        env._bounce_yaw_step = -1
+    return env._bounce_yaw_net
+
+
+def _update_bounce_yaw(env: ManagerBasedRlEnv, asset: Entity) -> None:
+    """Integrate the (unwrapped) trunk yaw once per control step.
+
+    Deliberately UNGATED — no support gate, no upright gate. In this move most
+    of the rotation is acquired while a foot (or both) is off the ground, so a
+    contact gate would erase exactly the signal we are trying to measure. That
+    gate is what made the earlier turn task's rotation measurement fragile.
+
+    Step-guarded: several metrics read the accumulators in the same control
+    step and they must only advance once.
+    """
+    net = _bounce_yaw_state(env)
+    step = int(env.common_step_counter)
+    if step == env._bounce_yaw_step:
+        return
+    yaw = _bounce_yaw_from_quat(asset.data.root_link_quat_w)
+    delta = torch.nan_to_num(wrap_to_pi(yaw - env._bounce_yaw_last), nan=0.0)
+    env._bounce_yaw_net = net + delta
+    env._bounce_yaw_path = env._bounce_yaw_path + delta.abs()
+    env._bounce_yaw_last = yaw
+    env._bounce_yaw_step = step
 
 
 def bounce_centre_gate(phase: torch.Tensor) -> torch.Tensor:
@@ -5247,44 +5291,6 @@ def bounce_stay_in_place_l1(
     return -bounce_centre_gate(bounce_phase(command)) * _bounce_drift(env, asset)
 
 
-def bounce_heading_hold(
-    env: ManagerBasedRlEnv,
-    std: float = 0.20,
-    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
-) -> torch.Tensor:
-    """Keep the trunk facing the direction it had at the start of the bounce.
-
-    `body_ang_vel` deliberately ignores the yaw component (it was inherited from
-    the turn task, where yaw WAS the task), so this is the only thing standing
-    between the bounce and an uncontrolled slow spin.
-    """
-    asset: Entity = env.scene[asset_cfg.name]
-    q = asset.data.root_link_quat_w
-    w, x, y, z = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
-    yaw = torch.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
-    return torch.exp(-(wrap_to_pi(yaw - env._bounce_origin_yaw) / std) ** 2)
-
-
-def bounce_heading_l1(
-    env: ManagerBasedRlEnv,
-    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
-) -> torch.Tensor:
-    """L1 companion for `bounce_heading_hold` (≤ 0 → POSITIVE weight).
-
-    The first run of this task logged the heading term at 0.03 with weight 0.5 —
-    0.3 % of the positive reward mass, i.e. a net turn was effectively unpriced —
-    and the Gaussian is numerically flat past ~0.4 rad, which is exactly where
-    the robot ended up (mean |Δyaw| ≈ 19°). This term charges the accumulated
-    turn linearly, so every degree of unwanted rotation costs something no
-    matter how far it has already drifted.
-    """
-    asset: Entity = env.scene[asset_cfg.name]
-    q = asset.data.root_link_quat_w
-    w, x, y, z = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
-    yaw = torch.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
-    return -wrap_to_pi(yaw - env._bounce_origin_yaw).abs()
-
-
 def bounce_pitch_balance(
     env: ManagerBasedRlEnv,
     std: float = 0.15,
@@ -5406,6 +5412,175 @@ def bounce_metric_pitch_deg(
     return torch.asin(g[:, 0].clamp(-1.0, 1.0)) * _DEG
 
 
+def bounce_metric_yaw_total_deg(
+    env: ManagerBasedRlEnv,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """SIGNED trunk rotation accumulated since the start of the episode (degrees).
+
+    Registered with ``reduce="last"``, so the logged value is how far the body
+    had turned when the episode ended — positive = counter-clockwise.
+
+    This is the measurement that decides whether "control how many turns" is
+    feasible at all:
+      • if the per-episode values all share one sign, the turn direction is
+        FIXED and a signed revolution target can be trained directly;
+      • if they scatter around zero, the body is only wobbling in yaw.
+    """
+    asset: Entity = env.scene[asset_cfg.name]
+    _update_bounce_yaw(env, asset)
+    return env._bounce_yaw_net * _DEG
+
+
+def bounce_metric_yaw_path_deg(
+    env: ManagerBasedRlEnv,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Total |yaw| travelled this episode (degrees, always ≥ 0).
+
+    Read it against `bounce_yaw_total_deg`: the ratio net/path is the "is this a
+    clean turn or just yaw wobble" score. Ratio near 1 = one consistent
+    rotation, which is a controllable signal; near 0 = the body is jittering
+    back and forth and a revolution target would have nothing to grip.
+    """
+    asset: Entity = env.scene[asset_cfg.name]
+    _update_bounce_yaw(env, asset)
+    return env._bounce_yaw_path * _DEG
+
+
+def bounce_metric_yaw_rate_deg_s(
+    env: ManagerBasedRlEnv,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Signed trunk yaw rate (degrees/s); its per-step average is the mean rate.
+
+    Compare with the rate a revolution target would need: one turn per 12 s
+    episode is 30 deg/s, two turns is 60 deg/s.
+    """
+    asset: Entity = env.scene[asset_cfg.name]
+    rate = torch.nan_to_num(asset.data.root_link_ang_vel_b[:, 2], nan=0.0)
+    return rate * _DEG
+
+
+# --------------------------------------------------------------------------- #
+# Bounce — the commanded rotation (turn 3 revolutions while bouncing)          #
+# --------------------------------------------------------------------------- #
+def bounce_episode_time(env: ManagerBasedRlEnv) -> torch.Tensor:
+    """Seconds since the start of the current episode (the turn schedule's clock).
+
+    The bounce PHASE wraps every ``BOUNCE_PERIOD_S``, so it cannot say "which
+    revolution am I on" — the target angle has to ride the episode clock. At
+    deployment nothing signals the revolution index either: the runtime just
+    plays the policy for a duration, and the policy keeps applying the rate it
+    learned here.
+    """
+    return env.episode_length_buf.to(torch.float32) * env.step_dt
+
+
+def bounce_turn_target_deg(
+    t: torch.Tensor,
+    rate_deg_s: float,
+    total_deg: float,
+    ramp_s: float,
+    turn_sign: float = -1.0,
+) -> torch.Tensor:
+    """Slew-limited rotation target (degrees, signed, + = counter-clockwise).
+
+    Trapezoid: ramp up over ``ramp_s``, hold at ``rate_deg_s``, ramp down over
+    ``ramp_s``, then hold the final angle forever. ``rate_deg_s`` is the PEAK
+    rate, derived in the cfg from the cycle budget so the commanded rotation
+    integrates to exactly ``total_deg``.
+
+    Ramps matter for the same reason they did in the earlier turn task: a
+    step-shaped rate command is not trackable, and its tracking error jumps.
+    The trailing hold is what trains "stop on the target" — without it the
+    policy keeps coasting past the requested number of revolutions.
+    """
+    turn_s = total_deg / rate_deg_s + ramp_s
+    tt = t.clamp(min=0.0, max=turn_s)
+    integral = torch.where(
+        tt < ramp_s,
+        tt.pow(2) / (2.0 * ramp_s),
+        torch.where(
+            tt < turn_s - ramp_s,
+            ramp_s / 2.0 + (tt - ramp_s),
+            (total_deg / rate_deg_s) - (turn_s - tt).pow(2) / (2.0 * ramp_s),
+        ),
+    )
+    return turn_sign * rate_deg_s * integral
+
+
+def bounce_turn_tracking(
+    env: ManagerBasedRlEnv,
+    rate_deg_s: float,
+    total_deg: float,
+    ramp_s: float,
+    turn_sign: float = -1.0,
+    std: float = 25.0,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """MAIN TASK TERM: the accumulated rotation follows the commanded schedule.
+
+    ``exp(−((net − target)/std)²)`` with both sides in degrees. This is what
+    pins the NUMBER of revolutions: the target ramps to ``total_deg`` and holds,
+    so stopping short, coasting past it, or reversing all cost reward.
+
+    It replaces the old "hold the start heading" pair on purpose — asking for
+    three revolutions while penalising any deviation from the start heading
+    would be self-contradictory.
+    """
+    asset: Entity = env.scene[asset_cfg.name]
+    _update_bounce_yaw(env, asset)
+    target = bounce_turn_target_deg(
+        bounce_episode_time(env), rate_deg_s, total_deg, ramp_s, turn_sign
+    )
+    error = env._bounce_yaw_net * _DEG - target
+    return torch.exp(-((error / std) ** 2))
+
+
+def bounce_turn_l1(
+    env: ManagerBasedRlEnv,
+    rate_deg_s: float,
+    total_deg: float,
+    ramp_s: float,
+    turn_sign: float = -1.0,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """L1 bootstrap for the rotation error (≤ 0 → POSITIVE weight).
+
+    On a 1080° schedule a 25° Gaussian is flat almost everywhere at the start
+    (the robot begins a whole revolution behind), so without a linear term there
+    is no gradient telling it to turn at all.
+    """
+    asset: Entity = env.scene[asset_cfg.name]
+    _update_bounce_yaw(env, asset)
+    target = bounce_turn_target_deg(
+        bounce_episode_time(env), rate_deg_s, total_deg, ramp_s, turn_sign
+    )
+    return -(env._bounce_yaw_net * _DEG - target).abs()
+
+
+def bounce_metric_turn_error_deg(
+    env: ManagerBasedRlEnv,
+    rate_deg_s: float,
+    total_deg: float,
+    ramp_s: float,
+    turn_sign: float = -1.0,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Measured − commanded rotation (degrees). Registered with reduce="last".
+
+    At the end of a healthy episode this reads ≈ 0 and `bounce_yaw_total_deg`
+    reads ≈ −1080: three clockwise revolutions, back to the starting heading.
+    """
+    asset: Entity = env.scene[asset_cfg.name]
+    _update_bounce_yaw(env, asset)
+    target = bounce_turn_target_deg(
+        bounce_episode_time(env), rate_deg_s, total_deg, ramp_s, turn_sign
+    )
+    return env._bounce_yaw_net * _DEG - target
+
+
 def bounce_print_episode_diagnostics(
     env: ManagerBasedRlEnv,
     env_ids: torch.Tensor | slice | None = None,
@@ -5427,12 +5602,18 @@ def bounce_print_episode_diagnostics(
         }
         print(
             "[bounce] env %02d | sway %5.1f° (ref %5.1f°, err %5.1f°) "
+            "| yaw %+7.1f° of %6.1f° (target %+7.1f°, err %+6.1f°, rate %+5.1f°/s) "
             "| foot air L %.2f R %.2f | drift %+.3f m | pitch %+5.1f°"
             % (
                 index,
                 terms.get("bounce_sway_amp_deg", nan),
                 terms.get("bounce_roll_ref_deg", nan),
                 terms.get("bounce_roll_error_deg", nan),
+                terms.get("bounce_yaw_total_deg", nan),
+                terms.get("bounce_yaw_path_deg", nan),
+                terms.get("bounce_turn_target_deg", nan),
+                terms.get("bounce_turn_error_deg", nan),
+                terms.get("bounce_yaw_rate_deg_s", nan),
                 terms.get("bounce_left_air_frac", nan),
                 terms.get("bounce_right_air_frac", nan),
                 terms.get("bounce_drift_m", nan),
