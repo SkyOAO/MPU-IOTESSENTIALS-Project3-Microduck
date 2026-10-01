@@ -399,10 +399,13 @@ def make_microduck_dance_env_cfg(
         params={**turn_cmd, "std": 25.0},
     )
     # L1 bootstrap (≤ 0 → POSITIVE weight): at spawn the robot is a whole
-    # revolution behind the 1080° schedule, where a 25° Gaussian is flat.
+    # revolution behind the schedule, where a 25° Gaussian is flat. The function
+    # returns the error in RADIANS, so the worst case is -2π·weight ≈ -1.9/step;
+    # returning it in degrees (as an earlier revision did) produced a -216/step
+    # penalty that grew with time and taught the robot to fall immediately.
     cfg.rewards["bounce_turn_l1"] = RewardTermCfg(
         func=microduck_mdp.bounce_turn_l1,
-        weight=0.6,
+        weight=0.3,
         params=dict(turn_cmd),
     )
 

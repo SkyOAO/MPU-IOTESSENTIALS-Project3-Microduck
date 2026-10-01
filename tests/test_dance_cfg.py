@@ -325,6 +325,8 @@ def test_turn_target_metric_is_callable_the_way_mjlab_calls_it():
     cfg = make_microduck_dance_env_cfg()
     term = cfg.metrics["bounce_turn_target_deg"]
     env = types.SimpleNamespace(
+        num_envs=2,
+        device=torch.device("cpu"),
         episode_length_buf=torch.zeros(2, dtype=torch.long),
         step_dt=0.02,
     )
@@ -333,9 +335,52 @@ def test_turn_target_metric_is_callable_the_way_mjlab_calls_it():
     assert value[0].item() == pytest.approx(0.0, abs=1e-6)
 
     # Half way through the turn it must be a real fraction of the target.
-    env.episode_length_buf = torch.full((2,), int(7.0 / 0.02), dtype=torch.long)
+    # NB: the clock is our own step counter, not `episode_length_buf`.
+    env._bounce_step_count = torch.full((2,), int(7.0 / 0.02), dtype=torch.long)
     value = term.func(env, **term.params)
     assert -BOUNCE_TURN_DEG < value[0].item() < 0.0
+
+
+def test_turn_clock_ignores_the_randomized_episode_length_buffer():
+    """The runner randomizes `episode_length_buf` at startup to decorrelate
+    episode phases, so it must NOT be the turn schedule's clock: on the first
+    episode of every env the schedule would start deep inside its ramp (logged
+    2026-10-01: target -324° while the episode was 0.5 s old)."""
+    import types
+
+    env = types.SimpleNamespace(
+        num_envs=2,
+        device=torch.device("cpu"),
+        step_dt=0.02,
+        episode_length_buf=torch.tensor([651, 900]),  # ← the randomized buffer
+    )
+    # Our own clock starts at 0 regardless of what the buffer says.
+    assert microduck_mdp.bounce_episode_time(env).tolist() == [0.0, 0.0]
+
+
+def test_l1_penalties_stay_O_of_one():
+    """An L1 term that scales with DEGREES is a trap: one revolution behind
+    costs 360×weight per step, GROWING with episode time, which pays the robot
+    to terminate early (the 2026-10-01 collapse: episodes 24 → 6.7 steps,
+    negative return, every task term 0). Worst-case weighted magnitudes here
+    must stay O(1)."""
+    import types
+
+    cfg = make_microduck_dance_env_cfg()
+    term = cfg.rewards["bounce_turn_l1"]
+    # Worst case: the robot has not turned at all while the target is complete.
+    env = types.SimpleNamespace(
+        num_envs=1,
+        device=torch.device("cpu"),
+        step_dt=0.02,
+        scene={"robot": types.SimpleNamespace(data=types.SimpleNamespace(
+            root_link_quat_w=torch.tensor([[1.0, 0.0, 0.0, 0.0]])
+        ))},
+        common_step_counter=0,
+        _bounce_step_count=torch.full((1,), 10_000, dtype=torch.long),
+    )
+    worst = term.func(env, **term.params) * term.weight
+    assert worst.item() > -3.0, f"turn L1 worst case {worst.item():.1f} is not O(1)"
 
 
 def test_play_mode_prints_per_episode_diagnostics():

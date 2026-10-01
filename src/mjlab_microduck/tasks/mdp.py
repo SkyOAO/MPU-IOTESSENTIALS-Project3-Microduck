@@ -5116,6 +5116,8 @@ def bounce_reset_origin(
     env._bounce_yaw_net[env_ids] = 0.0
     env._bounce_yaw_path[env_ids] = 0.0
     env._bounce_yaw_last[env_ids] = env._bounce_origin_yaw[env_ids]
+    # ... and the turn schedule's clock, so t = 0 is the start of this episode.
+    _bounce_clock_state(env)[env_ids] = 0
 
 
 def _bounce_drift(
@@ -5159,6 +5161,9 @@ def _update_bounce_yaw(env: ManagerBasedRlEnv, asset: Entity) -> None:
     env._bounce_yaw_path = env._bounce_yaw_path + delta.abs()
     env._bounce_yaw_last = yaw
     env._bounce_yaw_step = step
+    # Same step guard: the episode clock used by the turn schedule advances once
+    # per control step.
+    _bounce_clock_state(env).add_(1)
 
 
 def bounce_centre_gate(phase: torch.Tensor) -> torch.Tensor:
@@ -5465,6 +5470,29 @@ def bounce_metric_yaw_rate_deg_s(
 # --------------------------------------------------------------------------- #
 # Bounce — the commanded rotation (turn 3 revolutions while bouncing)          #
 # --------------------------------------------------------------------------- #
+def _bounce_clock_state(env: ManagerBasedRlEnv) -> torch.Tensor:
+    """Per-env control steps since the bounce episode started.
+
+    Deliberately NOT ``env.episode_length_buf``: the rsl_rl runner RANDOMIZES
+    that buffer at startup (``torch.randint_like(..., high=max_episode_length)``,
+    to decorrelate episode phases), so on the first episode of every env it does
+    not start at 0. Using it as the turn schedule's clock means the robot's very
+    first episode begins already deep inside the ramp — measured 2026-10-01: the
+    logged target read -324° while the episode was still 0.5 s old, i.e. the
+    robot was a full revolution "behind" before it took a step, and the turn
+    penalty taught it to fall immediately.
+
+    This counter is zeroed by `bounce_reset_origin` and advanced once per
+    control step by `_update_bounce_yaw`, so t = 0 always means "start of this
+    episode".
+    """
+    if not hasattr(env, "_bounce_step_count"):
+        env._bounce_step_count = torch.zeros(
+            env.num_envs, device=env.device, dtype=torch.long
+        )
+    return env._bounce_step_count
+
+
 def bounce_episode_time(env: ManagerBasedRlEnv) -> torch.Tensor:
     """Seconds since the start of the current episode (the turn schedule's clock).
 
@@ -5474,7 +5502,7 @@ def bounce_episode_time(env: ManagerBasedRlEnv) -> torch.Tensor:
     plays the policy for a duration, and the policy keeps applying the rate it
     learned here.
     """
-    return env.episode_length_buf.to(torch.float32) * env.step_dt
+    return _bounce_clock_state(env).to(torch.float32) * env.step_dt
 
 
 def bounce_turn_target_deg(
@@ -5551,13 +5579,20 @@ def bounce_turn_l1(
     On a 1080° schedule a 25° Gaussian is flat almost everywhere at the start
     (the robot begins a whole revolution behind), so without a linear term there
     is no gradient telling it to turn at all.
+
+    SCALE MATTERS: the error is returned in RADIANS, not the degrees the
+    Gaussian uses. An earlier revision returned degrees, so a robot one
+    revolution behind was charged 360 × weight per step — a penalty that GREW
+    with every step the episode survived. The policy did the optimal thing under
+    that reward and learned to terminate in 6.7 steps; the logged return went
+    negative and all the task terms read 0. Every L1 term here must be O(1).
     """
     asset: Entity = env.scene[asset_cfg.name]
     _update_bounce_yaw(env, asset)
     target = bounce_turn_target_deg(
         bounce_episode_time(env), rate_deg_s, total_deg, ramp_s, turn_sign
     )
-    return -(env._bounce_yaw_net * _DEG - target).abs()
+    return -((env._bounce_yaw_net * _DEG - target).abs() / _DEG)
 
 
 def bounce_metric_turn_error_deg(
