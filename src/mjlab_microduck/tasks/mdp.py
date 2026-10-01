@@ -5581,6 +5581,24 @@ def bounce_metric_turn_error_deg(
     return env._bounce_yaw_net * _DEG - target
 
 
+def bounce_metric_turn_target_deg(
+    env: ManagerBasedRlEnv,
+    rate_deg_s: float,
+    total_deg: float,
+    ramp_s: float,
+    turn_sign: float = -1.0,
+) -> torch.Tensor:
+    """The commanded rotation at the current episode time (degrees, signed).
+
+    Thin env-wrapper around the pure `bounce_turn_target_deg` schedule: mjlab
+    calls registered terms as ``func(env, **params)``, so the pure helper cannot
+    be registered directly (it would receive the env as its ``t``).
+    """
+    return bounce_turn_target_deg(
+        bounce_episode_time(env), rate_deg_s, total_deg, ramp_s, turn_sign
+    )
+
+
 def bounce_print_episode_diagnostics(
     env: ManagerBasedRlEnv,
     env_ids: torch.Tensor | slice | None = None,

@@ -294,6 +294,50 @@ def test_diagnostics_are_registered_as_episode_metrics():
         assert callable(cfg.metrics[name].func), name
 
 
+def test_every_registered_term_takes_env_as_its_first_parameter():
+    """mjlab calls reward/metric functions as ``func(env, **params)``.
+
+    Registering a pure helper by mistake binds the env to whatever its first
+    argument is and only explodes at run time — the 2026-10-01 crash was
+    ``bounce_turn_target_deg(t, ...)`` registered as a metric, so ``t`` became
+    the env and ``t.clamp`` raised AttributeError. Signature binding alone
+    cannot catch that; the parameter NAME can.
+    """
+    import inspect
+
+    cfg = make_microduck_dance_env_cfg()
+    for kind, terms in (("reward", cfg.rewards), ("metric", cfg.metrics)):
+        for name, term in terms.items():
+            if not inspect.isfunction(term.func):
+                continue  # class-based stock terms are instantiated with (cfg, env)
+            first = next(iter(inspect.signature(term.func).parameters))
+            assert first == "env", f"{kind} '{name}' must take env first, got {first!r}"
+
+
+def test_turn_target_metric_is_callable_the_way_mjlab_calls_it():
+    """Call the registered wrapper exactly as the metrics manager does.
+
+    The static audit above can be satisfied by a wrapper that still crashes
+    inside; this actually runs it against a stub env.
+    """
+    import types
+
+    cfg = make_microduck_dance_env_cfg()
+    term = cfg.metrics["bounce_turn_target_deg"]
+    env = types.SimpleNamespace(
+        episode_length_buf=torch.zeros(2, dtype=torch.long),
+        step_dt=0.02,
+    )
+    value = term.func(env, **term.params)
+    assert value.shape == (2,)
+    assert value[0].item() == pytest.approx(0.0, abs=1e-6)
+
+    # Half way through the turn it must be a real fraction of the target.
+    env.episode_length_buf = torch.full((2,), int(7.0 / 0.02), dtype=torch.long)
+    value = term.func(env, **term.params)
+    assert -BOUNCE_TURN_DEG < value[0].item() < 0.0
+
+
 def test_play_mode_prints_per_episode_diagnostics():
     train_cfg = make_microduck_dance_env_cfg(play=False)
     play_cfg = make_microduck_dance_env_cfg(play=True)

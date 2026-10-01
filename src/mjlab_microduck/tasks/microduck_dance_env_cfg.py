@@ -551,7 +551,10 @@ def make_microduck_dance_env_cfg(
         func=microduck_mdp.bounce_metric_yaw_rate_deg_s, reduce="mean"
     )
     cfg.metrics["bounce_turn_target_deg"] = MetricsTermCfg(
-        func=microduck_mdp.bounce_turn_target_deg,
+        # NB: the env-wrapper, not the pure `bounce_turn_target_deg` schedule —
+        # mjlab calls metrics as func(env, **params) and the pure helper would
+        # receive the env as its `t`.
+        func=microduck_mdp.bounce_metric_turn_target_deg,
         params=dict(
             rate_deg_s=BOUNCE_TURN_RATE_DEG_S,
             total_deg=BOUNCE_TURN_DEG,
