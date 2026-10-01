@@ -1,55 +1,30 @@
-"""Microduck in-place turn dance task.
+"""Microduck in-place march (dance) task.
 
-Episodic policy: the robot starts standing, turns exactly one full revolution
-CLOCKWISE in place (ω_z < 0), and settles back to a stand on the spot it started
-from. It is the first half of the deployment combo "turn one revolution, then
-forward roll": finishing standing on the starting position and heading is what
-lets the existing roulade policy take over (that policy was trained to start
-rolling from a standstill).
+Episodic phase policy: the robot steps in place, shifting its weight from foot
+to foot with a deliberately LARGE sway — the body leans left while the right
+foot is up, then leans right while the left foot is up. One cycle
+(``MARCH_PERIOD_S``):
 
-Timing (one cycle per episode, `EPISODE_LENGTH_S = DANCE_PERIOD_S + 1`):
-    [0.0, 11.5) s   trapezoid turn — ramp 0.5 s, hold 0.571 rad/s, ramp 0.5 s,
-                    so the commanded rotation integrates to exactly 2π
-    [11.5, 13.5) s  settle — ω_ref = 0, stand still
-    [13.5, 14.5) s  episode tail — still 0, trains the stop
+    φ ∈ [0.00, 0.50)   LEFT foot planted, RIGHT foot lifts, trunk leans LEFT
+    φ ∈ [0.50, 1.00)   RIGHT foot planted, LEFT foot lifts, trunk leans RIGHT
 
-The revolution is MEASURED, not assumed: `dance_turn_angle_tracking` reads a
-per-env accumulator of the (support- and upright-gated) trunk yaw and compares
-it against the commanded rotation. The old two-turn dance only rewarded the
-instantaneous yaw rate, so nothing pinned the rotation actually achieved — its
-logged rate tracking averaged exp(−err²/0.5) ≈ 0.08 (RMS |Δω| ≈ 1.1 rad/s
-against a 0.785 rad/s command).
+The phase travels in the twist slot as ``[cos(2πφ), sin(2πφ), 0]`` — the same
+contract the runtime's one-shot button slot uses for ground_pick / spin — so the
+move reuses `GroundPickPhaseCommand` and adds no command class.
 
-Head: the four head joints are held near HOME (the head keeps facing forward
-while the body turns). They are NOT a balance mechanism — measured on
-robot_walk.xml the whole head workspace moves the body CoM by only ±3.8 mm
-laterally — so nothing here asks the head to stabilise the turn.
+The whole move is TWO phase-referenced terms (`march_roll_tracking` for the
+sway, `march_step_tracking` for the alternation) plus "stay on the spot" and
+"do not tip over". That is deliberate: the previous revision of this task died
+under reward-shaping patches, so anything that is not the sway, the step, or a
+stock regulariser has been kept out.
 
-REWARD MASS (2026-10-01 lesson). The first run of this task reached
-mean_reward 86 while `dance_turn_angle_tracking` was only 5.5 % of the positive
-reward: the head terms were 38 %, `upright` 23 %, and the settle tail paid a
-removed rate term 5.0/step for standing perfectly still. The policy was halfway
-into the do-nothing basin (stops after ~half a revolution, splays its legs and
-freezes). Rules now encoded here and locked by tests/test_dance_cfg.py:
-  • the rotation task term must stay ≥ 2× any single style/regulariser term;
-  • no term may pay for standing still during the settle tail;
-  • `dance_stay_in_place` uses a 10 cm std, not 3 cm — the 3 cm Gaussian was
-    numerically dead by the time the robot had drifted 0.6 m.
+Why `march_pitch_balance` replaces the stock `upright`: `upright` penalises roll
+as well, and roll IS the task here — asking for a 12° sway while penalising
+tilt would be self-defeating. Left/right is the task; fore/aft is the balance.
 
-STABILITY OVER SPEED (2026-10-01, second run). After the rebalance the rotation
-loop worked (final angle error within ±10°, no more freeze) but the robot fell
-in EVERY episode — `time_out` = 0 for the whole run, mean length 315/575 steps,
-falling around 250° of the revolution. Three levers, no new shaping terms:
-  • revolution slowed 8.0 → 11.0 s (completion first);
-  • `upright` 2.0 → 3.0 with std 0.224 → 0.20 (it was buying rotation with
-    tilt: the logged upright raw value had fallen 0.80 → 0.68);
-  • `body_ang_vel` −0.05 → −0.15 (trunk pitch/roll rate; the term a head
-    counterweight or head-yaw flywheel can improve without giving up the turn);
-  • `action_rate_l2` curriculum slid earlier and heavier (−0.08 from step 0,
-    −0.15 by 1500 iterations) — the logged action rate was ~29.5 summed over
-    14 joints, i.e. the policy was chattering.
-No head-assist reward is added yet: the head is still free (its tracking terms
-are only 0.25), and `dance_head_excursion_deg` measures whether it moves at all.
+Sway amplitude is the headline requirement, so it is measured, not assumed:
+`Episode_Metrics/march_sway_amp_deg` (peak-to-peak/2 over the episode) answers
+"is the motion big enough?" directly.
 """
 
 import math
@@ -115,30 +90,17 @@ ENCODER_BIAS_RANGE = (-0.015, 0.015)  # ±0.86° per-joint encoder offset (const
 BASE_ORIENTATION_MAX_PITCH_DEG = 10.0  # ±10° forward/backward tilt at episode start
 BASE_ORIENTATION_MAX_ROLL_DEG = 5.0  # ±5° side-to-side tilt at episode start
 
-# Dance timing and geometry — one clockwise revolution, then settle
-DANCE_TURN_ANGLE = 2.0 * math.pi            # exactly one full revolution
-# Slowed from a full revolution in 8.0 s → 11.0 s (0.785 → 0.571 rad/s).
-# Reason (2026-10-01 run, 750 iters): rotation tracking was solved — final angle
-# error within ±10° — but NO episode ever reached the timeout (`time_out` = 0
-# throughout, `fell_over` the only termination, mean length 315/575 steps). The
-# robot held the pivot for ~6 s and fell around 250° of the revolution.
-# Completion first: 40 % more wall time per revolution. Raising this back toward
-# 8 s is a one-constant change once a full cycle survives.
-DANCE_TURN_SECONDS_AT_FULL_SPEED = 11.0
-DANCE_TURN_SPEED = DANCE_TURN_ANGLE / DANCE_TURN_SECONDS_AT_FULL_SPEED
-DANCE_RAMP_S = 0.5                          # trapezoid ramp at each end of the turn
-DANCE_SETTLE_S = 2.0                        # stand-still segment (hand-off window)
-# Derived so the commanded rotation integrates to exactly one revolution.
-DANCE_TURN_S = DANCE_TURN_SECONDS_AT_FULL_SPEED + DANCE_RAMP_S      # 11.5 s
-DANCE_PERIOD_S = DANCE_TURN_S + DANCE_SETTLE_S                      # 13.5 s
-# ω_z convention (x forward, y left, z up): negative = clockwise. Must match
-# microduck_mdp.DANCE_TURN_SIGN_CW (asserted in tests/test_dance_cfg.py).
-DANCE_TURN_SIGN = -1.0
-# 1 s of tail only: the settle segment already trains the stop, and every extra
-# second of "stand still" is a second where a collapsed policy collects
-# regularizer reward for free (2026-10-01 run: 4 s of stand-still out of 12.5 s
-# was the single biggest do-nothing payout).
-EPISODE_LENGTH_S = DANCE_PERIOD_S + 1.0                             # 14.5 s
+# March timing and geometry — left-right weight shift, one step per half cycle
+MARCH_PERIOD_S = 2.0        # 1 s per stance half: slow enough to read as a sway
+MARCH_EPISODES_CYCLES = 6   # cycles per episode (more data, and the rhythm is
+#                             cyclic, so extra cycles cost nothing to learn)
+EPISODE_LENGTH_S = MARCH_PERIOD_S * MARCH_EPISODES_CYCLES           # 12.0 s
+# Target trunk roll at the peak of each stance half. The stance foot's inner
+# edge is at y = +21.2 mm and its centre at +40.7 mm, with the CoM 148 mm up —
+# so ~8° of lean is the MINIMUM to unload the other foot and ~15° puts the CoM
+# over the middle of the stance foot. 12° is "large but still catchable".
+MARCH_SWAY_DEG = 12.0
+MARCH_SWAY_AMPLITUDE = math.radians(MARCH_SWAY_DEG)
 
 import mujoco as _mujoco
 import mjlab.terrains as terrain_gen
@@ -334,30 +296,16 @@ def make_microduck_dance_env_cfg(
     cfg.rewards["pose"].params["std_walking"] = std_walking
     cfg.rewards["pose"].params["std_running"] = std_walking
     # Pose reward operates on LEG joints only. Head direction is handled by
-    # dance_head_yaw_tracking, so keep head/neck out of this HOME-pulling term.
+    # march_head_hold, so keep head/neck out of this HOME-pulling term.
     cfg.rewards["pose"].params["asset_cfg"] = SceneEntityCfg(
         "robot", joint_names=(r"^(?!passive_|.*neck.*|.*head.*).*",)
     )
     cfg.rewards["pose"].params["walking_threshold"] = 0.01
     cfg.rewards["pose"].weight = 1.0
 
-    # Body-specific reward configurations
-    cfg.rewards["upright"].params["asset_cfg"].body_names = ("trunk_base",)
-    # upright: deliberately strong.
-    # 2026-07 pitch-vs-speed eval: the policy walks with a +2-4° steady forward
-    # lean (p90 ~6-8°) and ~2/3 of push-induced falls at speed are FORWARD. At
-    # weight 1.0 / std²=0.1 a 4° lean cost ~0.05/step — effectively free. At
-    # 2.0 / std²=0.05 it costs ~0.19/step: enough gradient to hold the trunk
-    # level in steady gait while transient lean (push recovery, accel) stays
-    # affordable.
-    # 2026-10-01 (750-iter run): the robot fell in EVERY episode and the logged
-    # trunk-upright raw value had dropped 0.80 → 0.68, i.e. it was buying
-    # rotation with tilt. Raise the weight and tighten the std: tilt is the
-    # leading indicator of the fall, and it is the term a balance strategy
-    # (ankle torque, hip torque, or the head as a fore/aft counterweight) can
-    # actually improve.
-    cfg.rewards["upright"].weight = 3.0
-    cfg.rewards["upright"].params["std"] = 0.20
+    # NOTE: the stock `upright` term is dropped further down — it penalises roll
+    # as well as pitch, and roll is exactly what this move is asked to produce.
+    # Its replacement, `march_pitch_balance`, keeps the pitch half only.
 
     # foot_clearance and foot_slip still read foot sites from asset_cfg.
     for reward_name in ["foot_clearance", "foot_slip"]:
@@ -378,82 +326,78 @@ def make_microduck_dance_env_cfg(
         params={"sensor_name": self_collision_cfg.name},
     )
 
-    # --- In-place turn task terms -------------------------------------------
-    # Absolute-rotation tracking is the primary signal: the old dance only
-    # rewarded the instantaneous yaw RATE, so nothing pinned the rotation
-    # actually achieved (logged rate tracking averaged exp(−err²/0.5) ≈ 0.08).
-    # This term is the only one that can express "one full revolution and back
-    # to the starting heading", and because its target stops at ±2π it also
-    # trains the settle segment ("stop, and stop on the target").
-    cfg.rewards["dance_turn_angle_tracking"] = RewardTermCfg(
-        func=microduck_mdp.dance_turn_angle_tracking,
-        weight=8.0,
-        params={"command_name": "twist", "std": 0.15},
+    # --- The move: sway + step -------------------------------------------------
+    # TWO task terms. `march_roll_tracking` is the sway (the visible move);
+    # `march_step_tracking` is the alternation that makes it a step rather than
+    # a wobble. Both are phase-referenced, so neither can be farmed by standing
+    # still or by shuffling off-rhythm.
+    march_cmd = {"command_name": "twist"}
+
+    cfg.rewards["march_roll_tracking"] = RewardTermCfg(
+        func=microduck_mdp.march_roll_tracking,
+        weight=5.0,
+        params={**march_cmd, "amplitude": MARCH_SWAY_AMPLITUDE, "std": 0.10},
     )
 
-    # L1 bootstrap on the same error: at spawn the robot is a whole revolution
-    # off, where the Gaussian is numerically flat — without this "stand still"
-    # has no gradient. Returns ≤ 0 → POSITIVE weight.
-    cfg.rewards["dance_turn_angle_l1"] = RewardTermCfg(
-        func=microduck_mdp.dance_turn_angle_l1,
-        weight=1.2,
-        params={"command_name": "twist"},
+    # L1 bootstrap on the same error (≤ 0 → POSITIVE weight). At the sway peaks
+    # the Gaussian is nearly flat — 12° = 0.21 rad against a 0.10 rad std — so
+    # without a linear term the first half-cycle has almost no gradient.
+    cfg.rewards["march_roll_l1"] = RewardTermCfg(
+        func=microduck_mdp.march_roll_l1,
+        weight=0.6,
+        params={**march_cmd, "amplitude": MARCH_SWAY_AMPLITUDE},
     )
 
-    # Turn without translating: the roulade hand-off expects the robot standing
-    # exactly where it started.
-    cfg.rewards["dance_stay_in_place"] = RewardTermCfg(
-        func=microduck_mdp.dance_stay_in_place,
-        weight=2.5,
+    cfg.rewards["march_step_tracking"] = RewardTermCfg(
+        func=microduck_mdp.march_step_tracking,
+        weight=3.0,
+        params={**march_cmd, "sensor_name": feet_ground_cfg.name},
+    )
+
+    # --- Keep it on the spot, upright, and calm --------------------------------
+    # The move is in place, so translation and yaw drift are defects.
+    cfg.rewards["march_stay_in_place"] = RewardTermCfg(
+        func=microduck_mdp.march_stay_in_place,
+        weight=2.0,
         params={"std": 0.10},
     )
-
-    # L1 companion (≤ 0 → POSITIVE weight): keeps pulling back once the Gaussian
-    # above has saturated.
-    cfg.rewards["dance_stay_in_place_l1"] = RewardTermCfg(
-        func=microduck_mdp.dance_stay_in_place_l1,
-        weight=1.5,
+    cfg.rewards["march_stay_in_place_l1"] = RewardTermCfg(
+        func=microduck_mdp.march_stay_in_place_l1,
+        weight=1.0,
         params={},
     )
+    cfg.rewards["march_heading_hold"] = RewardTermCfg(
+        func=microduck_mdp.march_heading_hold,
+        weight=0.5,
+        params={"std": 0.20},
+    )
 
-    cfg.rewards["dance_head_yaw_tracking"] = RewardTermCfg(
-        func=microduck_mdp.dance_head_yaw_tracking,
-        weight=0.25,
+    # Balance = pitch only. The stock `upright` penalises roll too, and roll is
+    # what this move is asked to produce, so it is replaced rather than tuned.
+    cfg.rewards.pop("upright", None)
+    cfg.rewards["march_pitch_balance"] = RewardTermCfg(
+        func=microduck_mdp.march_pitch_balance,
+        weight=2.0,
         params={"std": 0.15},
     )
 
-    cfg.rewards["dance_head_pitch_tracking"] = RewardTermCfg(
-        func=microduck_mdp.dance_head_pitch_tracking,
-        weight=0.25,
-        params={"std": 0.10},
+    # One head term instead of four: the head is 38 % of the mass and should not
+    # flail, but this move asks nothing else of it.
+    cfg.rewards["march_head_hold"] = RewardTermCfg(
+        func=microduck_mdp.march_head_hold,
+        weight=0.4,
+        params={"std": 0.30},
     )
 
-    cfg.rewards["dance_neck_pitch_tracking"] = RewardTermCfg(
-        func=microduck_mdp.dance_neck_pitch_tracking,
-        weight=0.25,
-        params={"std": 0.15},
-    )
-
-    cfg.rewards["dance_head_roll_tracking"] = RewardTermCfg(
-        func=microduck_mdp.dance_head_roll_tracking,
-        weight=0.25,
-        params={"std": 0.10},
-    )
-
-    # `track_angular_velocity` is REMOVED (not re-weighted): during the settle
-    # tail the commanded ω is 0, so it paid 5.0/step for standing perfectly
-    # still — a do-nothing annuity that out-earned the turn itself. The angle
-    # closed loop above replaces it and, unlike it, actually measures the result.
+    # `track_*_velocity` compare the twist slot to real velocities. The slot now
+    # carries the phase pair [cos, sin, 0], so both would be tracking a unit
+    # circle as if it were m/s — removed, not re-weighted. Position/heading
+    # drift is priced by the march_* terms above.
+    cfg.rewards.pop("track_linear_velocity", None)
     cfg.rewards.pop("track_angular_velocity", None)
 
-    # Kept as the "do not translate" per-step term (the angle/settle terms only
-    # price position, this one prices velocity). Halved: it also penalises v_z,
-    # which a stepping gait cannot drive to zero.
-    cfg.rewards["track_linear_velocity"].weight = 1.0
-    cfg.rewards["track_linear_velocity"].params["std"] = math.sqrt(0.1)
-
     # `pose` stays as the leg-posture anchor (it is what stopped the splayed-leg
-    # freeze), but below the task term.
+    # freeze), but below the task terms.
     cfg.rewards["pose"].weight = 0.5
 
     cfg.rewards["air_time"].weight = 3.0
@@ -464,67 +408,58 @@ def make_microduck_dance_env_cfg(
 
     cfg.rewards["foot_swing_height"].params["target_height"] = 0.02
 
-    # Gate the gait-shaping terms on the commanded yaw rate instead of leaving
-    # them permanently on (they used to be pinned at command_threshold = 0.0):
-    # |ω| = turn_speed while turning and exactly 0 through the settle segment,
-    # so a 0.1 threshold stops them paying the robot to march in place after the
-    # revolution is finished.
+    # The gait-shaping terms self-gate on |cmd_xy| + |cmd_z|. The march slot
+    # carries [cos, sin, 0] (unit circle) and the march never stops, so the gate
+    # is always open — which is what a continuous step-in-place wants.
     for _term in ("air_time", "foot_clearance", "foot_swing_height", "foot_slip"):
         cfg.rewards[_term].params["command_threshold"] = 0.1
 
     cfg.rewards["foot_slip"].weight = -0.4
 
-    # Trunk pitch/roll RATE. `body_angular_velocity_penalty` only penalises the
-    # x/y components (yaw is the task, so it is deliberately excluded), which
-    # makes this the balance channel: it is the term a head counterweight /
-    # head-yaw flywheel can improve without giving up the turn. Was -0.05 and
-    # the logged raw value was ~5.1 (rad/s)^2 — effectively unpriced.
-    cfg.rewards["body_ang_vel"].weight = -0.15
+    # Trunk pitch/roll rate: damps the sway instead of forbidding it. Kept small
+    # on purpose — the move IS a trunk rotation, so this must not out-bid it.
+    cfg.rewards["body_ang_vel"].weight = -0.05
     cfg.rewards["angular_momentum"].weight = -0.02
 
-    # Action smoothness: keep the curriculum gentle to avoid large reward jumps.
-    cfg.rewards["action_rate_l2"].weight = -0.05
-
-    # NOTE: no neck-only action-rate term — the shared action_rate_l2 sums over
-    # all 14 action dims. Head direction is shaped by dance_head_yaw_tracking.
+    # Action smoothness (curriculum below keeps tightening it). The previous
+    # turn task chattered at ~29.5 summed over 14 joints; a march is a rhythm,
+    # not a whip, so smoothing is priced from the start.
+    cfg.rewards["action_rate_l2"].weight = -0.08
 
     # --- Diagnostics --------------------------------------------------------
     # mjlab's MetricsManager: no reward weight, no dt scaling, logged as
-    # `Episode_Metrics/dance_*`. `reduce="last"` = the value at the FINAL step
-    # of the episode, i.e. exactly "how far did it actually rotate / where did
-    # it end up this episode"; `reduce="mean"` for the tilt / rate curves.
-    # These are the numbers to read before touching a reward again.
-    cfg.metrics["dance_rotation_deg"] = MetricsTermCfg(
-        func=microduck_mdp.dance_metric_rotation_deg, reduce="last"
+    # `Episode_Metrics/march_*`. `reduce="last"` = value at the FINAL step of the
+    # episode (sway amplitude reached, where it ended up); `reduce="mean"` for
+    # the per-step curves. These are the numbers to read before touching a
+    # reward again.
+    cfg.metrics["march_sway_amp_deg"] = MetricsTermCfg(
+        func=microduck_mdp.march_metric_sway_amp_deg, reduce="last"
     )
-    cfg.metrics["dance_target_deg"] = MetricsTermCfg(
-        func=microduck_mdp.dance_metric_target_deg, reduce="last"
+    cfg.metrics["march_roll_ref_deg"] = MetricsTermCfg(
+        func=microduck_mdp.march_metric_roll_ref_deg,
+        params={"command_name": "twist", "amplitude": MARCH_SWAY_AMPLITUDE},
+        reduce="last",
     )
-    cfg.metrics["dance_rotation_error_deg"] = MetricsTermCfg(
-        func=microduck_mdp.dance_metric_rotation_error_deg, reduce="last"
+    cfg.metrics["march_roll_error_deg"] = MetricsTermCfg(
+        func=microduck_mdp.march_metric_roll_error_deg,
+        params={"command_name": "twist", "amplitude": MARCH_SWAY_AMPLITUDE},
+        reduce="mean",
     )
-    cfg.metrics["dance_drift_x_m"] = MetricsTermCfg(
-        func=microduck_mdp.dance_metric_drift_x_m, reduce="last"
+    cfg.metrics["march_left_air_frac"] = MetricsTermCfg(
+        func=microduck_mdp.march_metric_foot_air_frac,
+        params={"sensor_name": feet_ground_cfg.name, "foot": 0},
+        reduce="mean",
     )
-    cfg.metrics["dance_drift_y_m"] = MetricsTermCfg(
-        func=microduck_mdp.dance_metric_drift_y_m, reduce="last"
+    cfg.metrics["march_right_air_frac"] = MetricsTermCfg(
+        func=microduck_mdp.march_metric_foot_air_frac,
+        params={"sensor_name": feet_ground_cfg.name, "foot": 1},
+        reduce="mean",
     )
-    cfg.metrics["dance_drift_m"] = MetricsTermCfg(
-        func=microduck_mdp.dance_metric_drift_m, reduce="last"
+    cfg.metrics["march_drift_m"] = MetricsTermCfg(
+        func=microduck_mdp.march_metric_drift_m, reduce="last"
     )
-    cfg.metrics["dance_pitch_deg"] = MetricsTermCfg(
-        func=microduck_mdp.dance_metric_pitch_deg, reduce="mean"
-    )
-    cfg.metrics["dance_roll_deg"] = MetricsTermCfg(
-        func=microduck_mdp.dance_metric_roll_deg, reduce="mean"
-    )
-    cfg.metrics["dance_yaw_rate"] = MetricsTermCfg(
-        func=microduck_mdp.dance_metric_yaw_rate, reduce="mean"
-    )
-    # Measurement only: is the head actually moving? Near zero here means the
-    # head is parked at HOME and cannot be contributing to balance.
-    cfg.metrics["dance_head_excursion_deg"] = MetricsTermCfg(
-        func=microduck_mdp.dance_metric_head_excursion_deg, reduce="mean"
+    cfg.metrics["march_pitch_deg"] = MetricsTermCfg(
+        func=microduck_mdp.march_metric_pitch_deg, reduce="mean"
     )
 
     # Events
@@ -540,19 +475,18 @@ def make_microduck_dance_env_cfg(
         mode="reset",
     )
 
-    cfg.events["dance_reset_origin"] = EventTermCfg(
-        func=microduck_mdp.dance_reset_origin,
+    cfg.events["march_reset_origin"] = EventTermCfg(
+        func=microduck_mdp.march_reset_origin,
         mode="reset",
     )
 
     if play:
-        # One console line per finished episode: rotation actually accumulated,
-        # commanded rotation, the error, the signed drift and the trunk tilt.
-        # Play only — in training these same numbers go to wandb as
-        # `Episode_Metrics/dance_*` (4096 envs finish episodes every step, so
-        # printing there would be unreadable).
-        cfg.events["dance_print_diagnostics"] = EventTermCfg(
-            func=microduck_mdp.dance_print_episode_diagnostics,
+        # One console line per finished episode: sway amplitude and error, the
+        # foot-lift fractions, drift and pitch. Play only — in training these
+        # same numbers go to wandb as `Episode_Metrics/march_*` (4096 envs
+        # finish episodes every step, so printing there would be unreadable).
+        cfg.events["march_print_diagnostics"] = EventTermCfg(
+            func=microduck_mdp.march_print_episode_diagnostics,
             mode="reset",
         )
 
@@ -819,8 +753,9 @@ def make_microduck_dance_env_cfg(
     else:
         cfg.events.pop("encoder_bias", None)
 
-    # Replace the base velocity command with the one-revolution turn cycle.
-    # The twist slot stays 3D but now means [vx=0, vy=0, angular_velocity_ref].
+    # Replace the base velocity command with the march phase. The twist slot
+    # stays 3D but now carries the runtime one-shot contract
+    # [cos(2πφ), sin(2πφ), 0]; φ = 0 is the standing hand-over point.
     command = deepcopy(cfg.commands["twist"])
     command.rel_standing_envs = 0.0
     command.rel_heading_envs = 0.0
@@ -828,20 +763,14 @@ def make_microduck_dance_env_cfg(
     command_kwargs = vars(command)
     command_kwargs.pop("rel_turn_in_place_envs", None)
 
-    cfg.commands["twist"] = microduck_mdp.DanceTurnVelocityCommandCfg(
+    cfg.commands["twist"] = microduck_mdp.GroundPickPhaseCommandCfg(
         **{
             **command_kwargs,
-            "class_type": microduck_mdp.DanceTurnVelocityCommand,
-            "turn_speed": DANCE_TURN_SPEED,
-            "turn_angle": DANCE_TURN_ANGLE,
-            "ramp_s": DANCE_RAMP_S,
-            "settle_s": DANCE_SETTLE_S,
-            "turn_sign": DANCE_TURN_SIGN,
+            "class_type": microduck_mdp.GroundPickPhaseCommand,
+            "period": MARCH_PERIOD_S,
+            # Deployment starts at φ = 0 (standing) and the phase then runs on
+            # its own clock, so every episode must start there too.
             "randomize_phase": False,
-            # Scene overlay: start marker, drift arrow, trunk heading (blue) vs
-            # commanded heading (green), with the numbers as labels in the viser
-            # viewer. Native viewer: press R to toggle.
-            "debug_vis": True,
         }
     )
 
@@ -886,12 +815,10 @@ def make_microduck_dance_env_cfg(
             cfg.scene.terrain.terrain_generator.num_cols = 5
             cfg.scene.terrain.terrain_generator.num_rows = 5
 
-    # action_rate weight ramp. Slid earlier and heavier after the 2026-10-01
-    # run: at iteration 750 the weight was still -0.05 and the logged raw value
-    # was ~29.5 (sum over 14 action dims → ~1.45 rad of target change per joint
-    # per 20 ms step), i.e. the policy was chattering, and `action_rate_l2` was
-    # the single largest cost in the whole stack. Smoothness is what turns a
-    # ballistic pivot into a balanceable one.
+    # action_rate weight ramp. The previous turn task chattered badly at −0.05
+    # (logged raw ~29.5 summed over 14 action dims ≈ 1.45 rad of target change
+    # per joint per 20 ms step), so smoothing starts higher now. A march is a
+    # rhythm, and a rhythm cannot be learned through a jittery controller.
     cfg.curriculum["action_rate_weight"] = CurriculumTermCfg(
         func=microduck_mdp.reward_weight,
         params={
