@@ -1,30 +1,33 @@
-"""Microduck in-place march (dance) task.
+"""Microduck in-place bounce (dance) task.
 
-Episodic phase policy: the robot steps in place, shifting its weight from foot
-to foot with a deliberately LARGE sway — the body leans left while the right
-foot is up, then leans right while the left foot is up. One cycle
-(``MARCH_PERIOD_S``):
+Episodic phase policy: an EXAGGERATED bouncy weight shift on the spot — the body
+leans left with the right foot up, then leans right with the left foot up, with
+the feet leaving the ground. One cycle (``BOUNCE_PERIOD_S``):
 
-    φ ∈ [0.00, 0.50)   LEFT foot planted, RIGHT foot lifts, trunk leans LEFT
-    φ ∈ [0.50, 1.00)   RIGHT foot planted, LEFT foot lifts, trunk leans RIGHT
+    φ ∈ [0.00, 0.50)   trunk leans LEFT, the RIGHT foot is the one that lifts
+    φ ∈ [0.50, 1.00)   trunk leans RIGHT, the LEFT foot is the one that lifts
+
+This is a bounce, not a tidy march and not a walk: both feet being airborne
+together is part of the look (the accepted first run spent >35 % of the time in
+flight). What it must NOT do is travel or turn.
 
 The phase travels in the twist slot as ``[cos(2πφ), sin(2πφ), 0]`` — the same
 contract the runtime's one-shot button slot uses for ground_pick / spin — so the
 move reuses `GroundPickPhaseCommand` and adds no command class.
 
-The whole move is TWO phase-referenced terms (`march_roll_tracking` for the
-sway, `march_step_tracking` for the alternation) plus "stay on the spot" and
-"do not tip over". That is deliberate: the previous revision of this task died
-under reward-shaping patches, so anything that is not the sway, the step, or a
-stock regulariser has been kept out.
+The whole move is TWO phase-referenced terms (`bounce_roll_tracking` for the
+sway, `bounce_lift_tracking` for the foot lift) plus "do not travel / do not
+turn / do not tip over". That is deliberate: an earlier revision of this task
+died under reward-shaping patches, so anything that is not the sway, the lift,
+or a containment term has been kept out.
 
-Why `march_pitch_balance` replaces the stock `upright`: `upright` penalises roll
+Why `bounce_pitch_balance` replaces the stock `upright`: `upright` penalises roll
 as well, and roll IS the task here — asking for a 12° sway while penalising
 tilt would be self-defeating. Left/right is the task; fore/aft is the balance.
 
 Sway amplitude is the headline requirement, so it is measured, not assumed:
-`Episode_Metrics/march_sway_amp_deg` (peak-to-peak/2 over the episode) answers
-"is the motion big enough?" directly.
+`Episode_Metrics/bounce_sway_amp_deg` (the roll component in phase with the
+reference) answers "is the motion big enough?" directly.
 """
 
 import math
@@ -90,17 +93,17 @@ ENCODER_BIAS_RANGE = (-0.015, 0.015)  # ±0.86° per-joint encoder offset (const
 BASE_ORIENTATION_MAX_PITCH_DEG = 10.0  # ±10° forward/backward tilt at episode start
 BASE_ORIENTATION_MAX_ROLL_DEG = 5.0  # ±5° side-to-side tilt at episode start
 
-# March timing and geometry — left-right weight shift, one step per half cycle
-MARCH_PERIOD_S = 2.0        # 1 s per stance half: slow enough to read as a sway
-MARCH_EPISODES_CYCLES = 6   # cycles per episode (more data, and the rhythm is
+# Bounce timing and geometry — one left lean + one right lean per cycle
+BOUNCE_PERIOD_S = 2.0        # 1 s per side: slow enough to read as a sway
+BOUNCE_EPISODES_CYCLES = 6   # cycles per episode (more data, and the rhythm is
 #                             cyclic, so extra cycles cost nothing to learn)
-EPISODE_LENGTH_S = MARCH_PERIOD_S * MARCH_EPISODES_CYCLES           # 12.0 s
+EPISODE_LENGTH_S = BOUNCE_PERIOD_S * BOUNCE_EPISODES_CYCLES           # 12.0 s
 # Target trunk roll at the peak of each stance half. The stance foot's inner
 # edge is at y = +21.2 mm and its centre at +40.7 mm, with the CoM 148 mm up —
 # so ~8° of lean is the MINIMUM to unload the other foot and ~15° puts the CoM
 # over the middle of the stance foot. 12° is "large but still catchable".
-MARCH_SWAY_DEG = 12.0
-MARCH_SWAY_AMPLITUDE = math.radians(MARCH_SWAY_DEG)
+BOUNCE_SWAY_DEG = 12.0
+BOUNCE_SWAY_AMPLITUDE = math.radians(BOUNCE_SWAY_DEG)
 
 import mujoco as _mujoco
 import mjlab.terrains as terrain_gen
@@ -296,7 +299,7 @@ def make_microduck_dance_env_cfg(
     cfg.rewards["pose"].params["std_walking"] = std_walking
     cfg.rewards["pose"].params["std_running"] = std_walking
     # Pose reward operates on LEG joints only. Head direction is handled by
-    # march_head_hold, so keep head/neck out of this HOME-pulling term.
+    # bounce_head_hold, so keep head/neck out of this HOME-pulling term.
     cfg.rewards["pose"].params["asset_cfg"] = SceneEntityCfg(
         "robot", joint_names=(r"^(?!passive_|.*neck.*|.*head.*).*",)
     )
@@ -305,7 +308,7 @@ def make_microduck_dance_env_cfg(
 
     # NOTE: the stock `upright` term is dropped further down — it penalises roll
     # as well as pitch, and roll is exactly what this move is asked to produce.
-    # Its replacement, `march_pitch_balance`, keeps the pitch half only.
+    # Its replacement, `bounce_pitch_balance`, keeps the pitch half only.
 
     # foot_clearance and foot_slip still read foot sites from asset_cfg.
     for reward_name in ["foot_clearance", "foot_slip"]:
@@ -326,65 +329,79 @@ def make_microduck_dance_env_cfg(
         params={"sensor_name": self_collision_cfg.name},
     )
 
-    # --- The move: sway + step -------------------------------------------------
-    # TWO task terms. `march_roll_tracking` is the sway (the visible move);
-    # `march_step_tracking` is the alternation that makes it a step rather than
-    # a wobble. Both are phase-referenced, so neither can be farmed by standing
-    # still or by shuffling off-rhythm.
-    march_cmd = {"command_name": "twist"}
+    # --- The move: sway + lift -------------------------------------------------
+    # TWO task terms. `bounce_roll_tracking` is the sway (the visible move);
+    # `bounce_lift_tracking` is the foot lift. Both are phase-referenced, so
+    # neither can be farmed by standing still or by bouncing off-rhythm.
+    bounce_cmd = {"command_name": "twist"}
 
-    cfg.rewards["march_roll_tracking"] = RewardTermCfg(
-        func=microduck_mdp.march_roll_tracking,
+    cfg.rewards["bounce_roll_tracking"] = RewardTermCfg(
+        func=microduck_mdp.bounce_roll_tracking,
         weight=5.0,
-        params={**march_cmd, "amplitude": MARCH_SWAY_AMPLITUDE, "std": 0.10},
+        params={**bounce_cmd, "amplitude": BOUNCE_SWAY_AMPLITUDE, "std": 0.10},
     )
 
     # L1 bootstrap on the same error (≤ 0 → POSITIVE weight). At the sway peaks
     # the Gaussian is nearly flat — 12° = 0.21 rad against a 0.10 rad std — so
     # without a linear term the first half-cycle has almost no gradient.
-    cfg.rewards["march_roll_l1"] = RewardTermCfg(
-        func=microduck_mdp.march_roll_l1,
+    cfg.rewards["bounce_roll_l1"] = RewardTermCfg(
+        func=microduck_mdp.bounce_roll_l1,
         weight=0.6,
-        params={**march_cmd, "amplitude": MARCH_SWAY_AMPLITUDE},
+        params={**bounce_cmd, "amplitude": BOUNCE_SWAY_AMPLITUDE},
     )
 
-    cfg.rewards["march_step_tracking"] = RewardTermCfg(
-        func=microduck_mdp.march_step_tracking,
+    cfg.rewards["bounce_lift_tracking"] = RewardTermCfg(
+        func=microduck_mdp.bounce_lift_tracking,
         weight=3.0,
-        params={**march_cmd, "sensor_name": feet_ground_cfg.name},
+        params={**bounce_cmd, "sensor_name": feet_ground_cfg.name},
     )
 
     # --- Keep it on the spot, upright, and calm --------------------------------
-    # The move is in place, so translation and yaw drift are defects.
-    cfg.rewards["march_stay_in_place"] = RewardTermCfg(
-        func=microduck_mdp.march_stay_in_place,
-        weight=2.0,
-        params={"std": 0.10},
+    # The move is in place, so translation and yaw drift are defects — but the
+    # bounce is allowed to be big, so the drift pressure is aimed at the NET
+    # drift only, not at the sway excursion:
+    #   • the Gaussian is wide (15 cm) and always on: it is a soft "roughly
+    #     here" term that must not fight a ±5 cm sway;
+    #   • the L1 is gated by `bounce_centre_gate`, so it reads the position at
+    #     the phase where the body passes through upright over the centre.
+    cfg.rewards["bounce_stay_in_place"] = RewardTermCfg(
+        func=microduck_mdp.bounce_stay_in_place,
+        weight=1.5,
+        params={**bounce_cmd, "std": 0.15},
     )
-    cfg.rewards["march_stay_in_place_l1"] = RewardTermCfg(
-        func=microduck_mdp.march_stay_in_place_l1,
+    cfg.rewards["bounce_stay_in_place_l1"] = RewardTermCfg(
+        func=microduck_mdp.bounce_stay_in_place_l1,
+        weight=3.0,
+        params=dict(bounce_cmd),
+    )
+    cfg.rewards["bounce_heading_hold"] = RewardTermCfg(
+        func=microduck_mdp.bounce_heading_hold,
         weight=1.0,
-        params={},
-    )
-    cfg.rewards["march_heading_hold"] = RewardTermCfg(
-        func=microduck_mdp.march_heading_hold,
-        weight=0.5,
         params={"std": 0.20},
+    )
+    # L1 companion: the first run logged the Gaussian above at 0.3 % of the
+    # positive reward mass and the robot ratcheted 19° around on average. This
+    # charges the accumulated turn linearly, so a net rotation always costs
+    # something. This is the "do not turn" term.
+    cfg.rewards["bounce_heading_l1"] = RewardTermCfg(
+        func=microduck_mdp.bounce_heading_l1,
+        weight=1.5,
+        params={},
     )
 
     # Balance = pitch only. The stock `upright` penalises roll too, and roll is
     # what this move is asked to produce, so it is replaced rather than tuned.
     cfg.rewards.pop("upright", None)
-    cfg.rewards["march_pitch_balance"] = RewardTermCfg(
-        func=microduck_mdp.march_pitch_balance,
+    cfg.rewards["bounce_pitch_balance"] = RewardTermCfg(
+        func=microduck_mdp.bounce_pitch_balance,
         weight=2.0,
         params={"std": 0.15},
     )
 
     # One head term instead of four: the head is 38 % of the mass and should not
     # flail, but this move asks nothing else of it.
-    cfg.rewards["march_head_hold"] = RewardTermCfg(
-        func=microduck_mdp.march_head_hold,
+    cfg.rewards["bounce_head_hold"] = RewardTermCfg(
+        func=microduck_mdp.bounce_head_hold,
         weight=0.4,
         params={"std": 0.30},
     )
@@ -392,7 +409,7 @@ def make_microduck_dance_env_cfg(
     # `track_*_velocity` compare the twist slot to real velocities. The slot now
     # carries the phase pair [cos, sin, 0], so both would be tracking a unit
     # circle as if it were m/s — removed, not re-weighted. Position/heading
-    # drift is priced by the march_* terms above.
+    # drift is priced by the bounce_* terms above.
     cfg.rewards.pop("track_linear_velocity", None)
     cfg.rewards.pop("track_angular_velocity", None)
 
@@ -408,8 +425,8 @@ def make_microduck_dance_env_cfg(
 
     cfg.rewards["foot_swing_height"].params["target_height"] = 0.02
 
-    # The gait-shaping terms self-gate on |cmd_xy| + |cmd_z|. The march slot
-    # carries [cos, sin, 0] (unit circle) and the march never stops, so the gate
+    # The gait-shaping terms self-gate on |cmd_xy| + |cmd_z|. The bounce slot
+    # carries [cos, sin, 0] (unit circle) and the bounce never stops, so the gate
     # is always open — which is what a continuous step-in-place wants.
     for _term in ("air_time", "foot_clearance", "foot_swing_height", "foot_slip"):
         cfg.rewards[_term].params["command_threshold"] = 0.1
@@ -422,44 +439,49 @@ def make_microduck_dance_env_cfg(
     cfg.rewards["angular_momentum"].weight = -0.02
 
     # Action smoothness (curriculum below keeps tightening it). The previous
-    # turn task chattered at ~29.5 summed over 14 joints; a march is a rhythm,
+    # turn task chattered at ~29.5 summed over 14 joints; a bounce is a rhythm,
     # not a whip, so smoothing is priced from the start.
     cfg.rewards["action_rate_l2"].weight = -0.08
 
     # --- Diagnostics --------------------------------------------------------
     # mjlab's MetricsManager: no reward weight, no dt scaling, logged as
-    # `Episode_Metrics/march_*`. `reduce="last"` = value at the FINAL step of the
+    # `Episode_Metrics/bounce_*`. `reduce="last"` = value at the FINAL step of the
     # episode (sway amplitude reached, where it ended up); `reduce="mean"` for
     # the per-step curves. These are the numbers to read before touching a
     # reward again.
-    cfg.metrics["march_sway_amp_deg"] = MetricsTermCfg(
-        func=microduck_mdp.march_metric_sway_amp_deg, reduce="last"
-    )
-    cfg.metrics["march_roll_ref_deg"] = MetricsTermCfg(
-        func=microduck_mdp.march_metric_roll_ref_deg,
-        params={"command_name": "twist", "amplitude": MARCH_SWAY_AMPLITUDE},
-        reduce="last",
-    )
-    cfg.metrics["march_roll_error_deg"] = MetricsTermCfg(
-        func=microduck_mdp.march_metric_roll_error_deg,
-        params={"command_name": "twist", "amplitude": MARCH_SWAY_AMPLITUDE},
+    # `reduce="mean"`: the per-step value is 2·roll·sin(2πφ), so its episode
+    # average IS the sway amplitude in phase with the reference (outlier-robust,
+    # unlike the (max−min)/2 it replaces).
+    cfg.metrics["bounce_sway_amp_deg"] = MetricsTermCfg(
+        func=microduck_mdp.bounce_metric_sway_amp_deg,
+        params={"command_name": "twist"},
         reduce="mean",
     )
-    cfg.metrics["march_left_air_frac"] = MetricsTermCfg(
-        func=microduck_mdp.march_metric_foot_air_frac,
+    cfg.metrics["bounce_roll_ref_deg"] = MetricsTermCfg(
+        func=microduck_mdp.bounce_metric_roll_ref_deg,
+        params={"command_name": "twist", "amplitude": BOUNCE_SWAY_AMPLITUDE},
+        reduce="last",
+    )
+    cfg.metrics["bounce_roll_error_deg"] = MetricsTermCfg(
+        func=microduck_mdp.bounce_metric_roll_error_deg,
+        params={"command_name": "twist", "amplitude": BOUNCE_SWAY_AMPLITUDE},
+        reduce="mean",
+    )
+    cfg.metrics["bounce_left_air_frac"] = MetricsTermCfg(
+        func=microduck_mdp.bounce_metric_foot_air_frac,
         params={"sensor_name": feet_ground_cfg.name, "foot": 0},
         reduce="mean",
     )
-    cfg.metrics["march_right_air_frac"] = MetricsTermCfg(
-        func=microduck_mdp.march_metric_foot_air_frac,
+    cfg.metrics["bounce_right_air_frac"] = MetricsTermCfg(
+        func=microduck_mdp.bounce_metric_foot_air_frac,
         params={"sensor_name": feet_ground_cfg.name, "foot": 1},
         reduce="mean",
     )
-    cfg.metrics["march_drift_m"] = MetricsTermCfg(
-        func=microduck_mdp.march_metric_drift_m, reduce="last"
+    cfg.metrics["bounce_drift_m"] = MetricsTermCfg(
+        func=microduck_mdp.bounce_metric_drift_m, reduce="last"
     )
-    cfg.metrics["march_pitch_deg"] = MetricsTermCfg(
-        func=microduck_mdp.march_metric_pitch_deg, reduce="mean"
+    cfg.metrics["bounce_pitch_deg"] = MetricsTermCfg(
+        func=microduck_mdp.bounce_metric_pitch_deg, reduce="mean"
     )
 
     # Events
@@ -475,18 +497,18 @@ def make_microduck_dance_env_cfg(
         mode="reset",
     )
 
-    cfg.events["march_reset_origin"] = EventTermCfg(
-        func=microduck_mdp.march_reset_origin,
+    cfg.events["bounce_reset_origin"] = EventTermCfg(
+        func=microduck_mdp.bounce_reset_origin,
         mode="reset",
     )
 
     if play:
         # One console line per finished episode: sway amplitude and error, the
         # foot-lift fractions, drift and pitch. Play only — in training these
-        # same numbers go to wandb as `Episode_Metrics/march_*` (4096 envs
+        # same numbers go to wandb as `Episode_Metrics/bounce_*` (4096 envs
         # finish episodes every step, so printing there would be unreadable).
-        cfg.events["march_print_diagnostics"] = EventTermCfg(
-            func=microduck_mdp.march_print_episode_diagnostics,
+        cfg.events["bounce_print_diagnostics"] = EventTermCfg(
+            func=microduck_mdp.bounce_print_episode_diagnostics,
             mode="reset",
         )
 
@@ -753,7 +775,7 @@ def make_microduck_dance_env_cfg(
     else:
         cfg.events.pop("encoder_bias", None)
 
-    # Replace the base velocity command with the march phase. The twist slot
+    # Replace the base velocity command with the bounce phase. The twist slot
     # stays 3D but now carries the runtime one-shot contract
     # [cos(2πφ), sin(2πφ), 0]; φ = 0 is the standing hand-over point.
     command = deepcopy(cfg.commands["twist"])
@@ -767,7 +789,7 @@ def make_microduck_dance_env_cfg(
         **{
             **command_kwargs,
             "class_type": microduck_mdp.GroundPickPhaseCommand,
-            "period": MARCH_PERIOD_S,
+            "period": BOUNCE_PERIOD_S,
             # Deployment starts at φ = 0 (standing) and the phase then runs on
             # its own clock, so every episode must start there too.
             "randomize_phase": False,
@@ -817,7 +839,7 @@ def make_microduck_dance_env_cfg(
 
     # action_rate weight ramp. The previous turn task chattered badly at −0.05
     # (logged raw ~29.5 summed over 14 action dims ≈ 1.45 rad of target change
-    # per joint per 20 ms step), so smoothing starts higher now. A march is a
+    # per joint per 20 ms step), so smoothing starts higher now. A bounce is a
     # rhythm, and a rhythm cannot be learned through a jittery controller.
     cfg.curriculum["action_rate_weight"] = CurriculumTermCfg(
         func=microduck_mdp.reward_weight,

@@ -5030,13 +5030,18 @@ class GroundPickPhaseCommandCfg(UniformVelocityCommandCfg):
 
 
 # --------------------------------------------------------------------------- #
-# Dance — march in place (weight shift + alternating foot lift)                #
+# Dance — exaggerated bounce in place                                           #
 # --------------------------------------------------------------------------- #
 #
-# One cycle (φ ∈ [0, 1), period = the cfg's `MARCH_PERIOD_S`):
+# One cycle (φ ∈ [0, 1), period = the cfg's `BOUNCE_PERIOD_S`):
 #
-#   φ ∈ [0.00, 0.50)   LEFT foot planted, RIGHT foot lifts, trunk leans LEFT
-#   φ ∈ [0.50, 1.00)   RIGHT foot planted, LEFT foot lifts, trunk leans RIGHT
+#   φ ∈ [0.00, 0.50)   trunk leans LEFT, the RIGHT foot is the one that lifts
+#   φ ∈ [0.50, 1.00)   trunk leans RIGHT, the LEFT foot is the one that lifts
+#
+# This is a bounce, not a walk and not a tidy march: the aim is a big, bouncy
+# weight shift where the feet leave the ground, and the robot MUST NOT travel or
+# turn while doing it. Both feet being airborne together is expected — the first
+# accepted run spent >35 % of the time in flight.
 #
 # The phase travels in the twist slot as ``[cos(2πφ), sin(2πφ), 0]`` — the same
 # contract the runtime's one-shot button slot uses for ground_pick / spin — so
@@ -5053,37 +5058,36 @@ class GroundPickPhaseCommandCfg(UniformVelocityCommandCfg):
 # instruction ("left, right, left, right").
 #
 # Motion-patch budget: the move itself is TWO phase-referenced terms — the roll
-# (the sway) and the foot lift (the stepping). Everything else here is either a
-# stock regulariser or "stay on the spot / do not tip over".
+# (the sway) and the foot lift. Everything else here is either a stock
+# regulariser or "do not travel / do not turn / do not tip over".
 _DEG = 180.0 / math.pi
 
 
-def march_phase(command: torch.Tensor) -> torch.Tensor:
-    """Recover the march phase φ ∈ [0, 1) from the twist command slot."""
+def bounce_phase(command: torch.Tensor) -> torch.Tensor:
+    """Recover the bounce phase φ ∈ [0, 1) from the twist command slot."""
     return torch.atan2(command[:, 1], command[:, 0]) / (2.0 * math.pi) % 1.0
 
 
-def march_roll_reference(phase: torch.Tensor, amplitude: float) -> torch.Tensor:
+def bounce_roll_reference(phase: torch.Tensor, amplitude: float) -> torch.Tensor:
     """Target trunk roll (rad, + = lean left) at the current phase."""
     return amplitude * torch.sin(2.0 * math.pi * phase)
 
 
-def _march_trunk_roll(asset: Entity) -> torch.Tensor:
+def _bounce_trunk_roll(asset: Entity) -> torch.Tensor:
     """Trunk roll from projected gravity (rad). Positive = leaning left."""
     g = torch.nan_to_num(asset.data.projected_gravity_b, nan=0.0)
     return torch.atan2(-g[:, 1], -g[:, 2])
 
 
-def march_reset_origin(
+def bounce_reset_origin(
     env: ManagerBasedRlEnv,
     env_ids: torch.Tensor,
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> None:
-    """Record the world pose at the start of the march (reset event).
+    """Record the world pose at the start of the bounce (reset event).
 
     Everything the move is judged against is relative to this: "did it stay on
-    the spot" and "did it keep facing the same way". Also restarts the roll
-    extremes that feed the sway-amplitude metric.
+    the spot" and "did it keep facing the same way".
     """
     asset: Entity = env.scene[asset_cfg.name]
     if env_ids is None:
@@ -5091,38 +5095,59 @@ def march_reset_origin(
     else:
         env_ids = env_ids.to(env.device, dtype=torch.long)
 
-    if not hasattr(env, "_march_origin_pos"):
+    if not hasattr(env, "_bounce_origin_pos"):
         dtype = asset.data.root_link_pos_w.dtype
-        env._march_origin_pos = torch.zeros(env.num_envs, 3, device=env.device, dtype=dtype)
-        env._march_origin_yaw = torch.zeros(env.num_envs, device=env.device, dtype=dtype)
-        env._march_roll_lo = torch.full((env.num_envs,), float("inf"), device=env.device, dtype=dtype)
-        env._march_roll_hi = torch.full((env.num_envs,), float("-inf"), device=env.device, dtype=dtype)
-        env._march_extrema_step = -1
+        env._bounce_origin_pos = torch.zeros(env.num_envs, 3, device=env.device, dtype=dtype)
+        env._bounce_origin_yaw = torch.zeros(env.num_envs, device=env.device, dtype=dtype)
 
-    env._march_origin_pos[env_ids] = asset.data.root_link_pos_w[env_ids]
+    env._bounce_origin_pos[env_ids] = asset.data.root_link_pos_w[env_ids]
     q = asset.data.root_link_quat_w[env_ids]
     w, x, y, z = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
-    env._march_origin_yaw[env_ids] = torch.atan2(
+    env._bounce_origin_yaw[env_ids] = torch.atan2(
         2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z)
     )
-    env._march_roll_lo[env_ids] = float("inf")
-    env._march_roll_hi[env_ids] = float("-inf")
-    env._march_extrema_step = -1
 
 
-def _march_drift(
+def _bounce_drift(
     env: ManagerBasedRlEnv,
     asset: Entity,
 ) -> torch.Tensor:
-    """Horizontal distance (m) of the trunk from its march-start position."""
-    delta = asset.data.root_link_pos_w - env._march_origin_pos
+    """Horizontal distance (m) of the trunk from its bounce-start position."""
+    delta = asset.data.root_link_pos_w - env._bounce_origin_pos
     return torch.sqrt(delta[:, 0] ** 2 + delta[:, 1] ** 2)
 
 
+def bounce_centre_gate(phase: torch.Tensor) -> torch.Tensor:
+    """1 when the sway crosses zero, 0 at the sway peaks.
+
+    ``cos(2πφ)²``. The sway itself translates the trunk: at 12° of lean the CoM
+    sits ~31 mm to the side (148 mm up), and far more during a real weight
+    shift. Judging "did it stay on the spot" at every instant therefore charges
+    the move the policy was asked to make. The honest criterion is the NET
+    drift, and the moment to read it is the phase where the reference passes
+    through zero and the body should be upright over the centre — hence this
+    gate.
+    """
+    return torch.cos(2.0 * math.pi * phase) ** 2
+
+
+def bounce_lift_schedule(phase: torch.Tensor) -> torch.Tensor:
+    """Which foot should be off the ground: ``[N, 2]`` of (LEFT up, RIGHT up).
+
+    First half of the cycle (φ < 0.5) the RIGHT foot is the airborne one, second
+    half the LEFT. This says nothing about the other foot: this task is an
+    exaggerated in-place BOUNCE, and both feet leaving the ground together is a
+    feature of it, not a defect.
+    """
+    right_up = (phase < 0.5).to(torch.float32)
+    left_up = 1.0 - right_up
+    return torch.stack((left_up, right_up), dim=-1)
+
+
 # --------------------------------------------------------------------------- #
-# March — the two task terms                                                   #
+# Bounce — the two task terms                                                   #
 # --------------------------------------------------------------------------- #
-def march_roll_tracking(
+def bounce_roll_tracking(
     env: ManagerBasedRlEnv,
     command_name: str,
     amplitude: float,
@@ -5138,12 +5163,12 @@ def march_roll_tracking(
     command = env.command_manager.get_command(command_name)
     assert command is not None, f"Command '{command_name}' not found."
     asset: Entity = env.scene[asset_cfg.name]
-    reference = march_roll_reference(march_phase(command), amplitude)
-    error = _march_trunk_roll(asset) - reference
+    reference = bounce_roll_reference(bounce_phase(command), amplitude)
+    error = _bounce_trunk_roll(asset) - reference
     return torch.exp(-((error / std) ** 2))
 
 
-def march_roll_l1(
+def bounce_roll_l1(
     env: ManagerBasedRlEnv,
     command_name: str,
     amplitude: float,
@@ -5158,77 +5183,117 @@ def march_roll_l1(
     command = env.command_manager.get_command(command_name)
     assert command is not None, f"Command '{command_name}' not found."
     asset: Entity = env.scene[asset_cfg.name]
-    reference = march_roll_reference(march_phase(command), amplitude)
-    return -torch.abs(_march_trunk_roll(asset) - reference)
+    reference = bounce_roll_reference(bounce_phase(command), amplitude)
+    return -torch.abs(_bounce_trunk_roll(asset) - reference)
 
 
-def march_step_tracking(
+def bounce_lift_tracking(
     env: ManagerBasedRlEnv,
     command_name: str,
     sensor_name: str,
 ) -> torch.Tensor:
-    """The phase-correct foot is off the ground.
+    """The scheduled foot is OFF the ground: RIGHT in the first half, LEFT in the second.
 
-    LEFT-stance half ⇒ the RIGHT foot must be up, and vice versa. This is the
-    *alternation* signal; the stock `feet_air_time` still shapes how each foot
-    is lifted and placed (a foot parked in the air for a whole half-cycle earns
-    nothing from it).
+    Deliberately only prices the lift, not the plant: this is an exaggerated
+    in-place bounce, and both feet being airborne together is part of the look
+    (the first run averaged 0.69/0.68 foot-air fractions, i.e. more than a third
+    of the time in flight, and that is the accepted target behaviour). The stock
+    `feet_air_time` still shapes how long and how high each lift is, and the
+    drift / heading terms keep the bounce from travelling or turning.
     """
     command = env.command_manager.get_command(command_name)
     assert command is not None, f"Command '{command_name}' not found."
-    right_should_be_up = (march_phase(command) < 0.5).to(torch.float32)
+    schedule = bounce_lift_schedule(bounce_phase(command))
     air_time = env.scene[sensor_name].data.current_air_time
     assert air_time is not None, f"Sensor '{sensor_name}' has no air-time field."
-    left_up = (air_time[:, 0] > 0.0).to(torch.float32)
-    right_up = (air_time[:, 1] > 0.0).to(torch.float32)
-    return right_should_be_up * right_up + (1.0 - right_should_be_up) * left_up
+    airborne = torch.stack(
+        (
+            (air_time[:, 0] > 0.0).to(torch.float32),
+            (air_time[:, 1] > 0.0).to(torch.float32),
+        ),
+        dim=-1,
+    )
+    # 1 when the scheduled foot is up; what the other foot does is not graded.
+    return (schedule * airborne).sum(dim=-1)
 
 
 # --------------------------------------------------------------------------- #
-# March — keep it on the spot and upright                                      #
+# Bounce — keep it on the spot and upright                                      #
 # --------------------------------------------------------------------------- #
-def march_stay_in_place(
+def bounce_stay_in_place(
     env: ManagerBasedRlEnv,
+    command_name: str = "twist",
     std: float = 0.10,
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
-    """Reward marching without walking off the spot."""
+    """Reward being centred when the sway crosses zero (see bounce_centre_gate)."""
+    command = env.command_manager.get_command(command_name)
+    assert command is not None, f"Command '{command_name}' not found."
     asset: Entity = env.scene[asset_cfg.name]
-    return torch.exp(-(_march_drift(env, asset) / std) ** 2)
+    centred = bounce_centre_gate(bounce_phase(command))
+    return centred * torch.exp(-(_bounce_drift(env, asset) / std) ** 2)
 
 
-def march_stay_in_place_l1(
+def bounce_stay_in_place_l1(
     env: ManagerBasedRlEnv,
+    command_name: str = "twist",
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
-    """L1 companion (≤ 0 → POSITIVE weight): keeps a gradient once the
-    Gaussian above has saturated (a 10 cm std is blind by 30 cm of drift)."""
+    """Gated L1 companion (≤ 0 → POSITIVE weight): constant gradient on the
+    NET drift, so a robot that has walked off the spot keeps being pulled back."""
+    command = env.command_manager.get_command(command_name)
+    assert command is not None, f"Command '{command_name}' not found."
     asset: Entity = env.scene[asset_cfg.name]
-    return -_march_drift(env, asset)
+    return -bounce_centre_gate(bounce_phase(command)) * _bounce_drift(env, asset)
 
 
-def march_heading_hold(
+def bounce_heading_hold(
     env: ManagerBasedRlEnv,
     std: float = 0.20,
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
-    """Keep the trunk facing the direction it had at the start of the march."""
+    """Keep the trunk facing the direction it had at the start of the bounce.
+
+    `body_ang_vel` deliberately ignores the yaw component (it was inherited from
+    the turn task, where yaw WAS the task), so this is the only thing standing
+    between the bounce and an uncontrolled slow spin.
+    """
     asset: Entity = env.scene[asset_cfg.name]
     q = asset.data.root_link_quat_w
     w, x, y, z = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
     yaw = torch.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
-    return torch.exp(-(wrap_to_pi(yaw - env._march_origin_yaw) / std) ** 2)
+    return torch.exp(-(wrap_to_pi(yaw - env._bounce_origin_yaw) / std) ** 2)
 
 
-def march_pitch_balance(
+def bounce_heading_l1(
+    env: ManagerBasedRlEnv,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """L1 companion for `bounce_heading_hold` (≤ 0 → POSITIVE weight).
+
+    The first run of this task logged the heading term at 0.03 with weight 0.5 —
+    0.3 % of the positive reward mass, i.e. a net turn was effectively unpriced —
+    and the Gaussian is numerically flat past ~0.4 rad, which is exactly where
+    the robot ended up (mean |Δyaw| ≈ 19°). This term charges the accumulated
+    turn linearly, so every degree of unwanted rotation costs something no
+    matter how far it has already drifted.
+    """
+    asset: Entity = env.scene[asset_cfg.name]
+    q = asset.data.root_link_quat_w
+    w, x, y, z = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
+    yaw = torch.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
+    return -wrap_to_pi(yaw - env._bounce_origin_yaw).abs()
+
+
+def bounce_pitch_balance(
     env: ManagerBasedRlEnv,
     std: float = 0.15,
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
-    """Trunk pitch near level — the march's balance term.
+    """Trunk pitch near level — the bounce's balance term.
 
     Deliberately replaces the stock `upright`: that one penalises roll too, and
-    roll is the thing the march is ASKED to do. Left/right is the task;
+    roll is the thing the bounce is ASKED to do. Left/right is the task;
     fore/aft is the balance.
     """
     asset: Entity = env.scene[asset_cfg.name]
@@ -5237,7 +5302,7 @@ def march_pitch_balance(
     return torch.exp(-((pitch / std) ** 2))
 
 
-def march_head_hold(
+def bounce_head_hold(
     env: ManagerBasedRlEnv,
     std: float = 0.30,
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
@@ -5261,29 +5326,33 @@ def march_head_hold(
 
 
 # --------------------------------------------------------------------------- #
-# March — diagnostics (MetricsManager; no reward weight, no dt scaling)        #
+# Bounce — diagnostics (MetricsManager; no reward weight, no dt scaling)        #
 # --------------------------------------------------------------------------- #
-def march_metric_sway_amp_deg(
+def bounce_metric_sway_amp_deg(
     env: ManagerBasedRlEnv,
+    command_name: str = "twist",
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
-    """Peak-to-peak sway achieved so far / 2, in degrees.
+    """Sway amplitude in phase with the reference (degrees).
 
-    Registered with ``reduce="last"`` so the logged value is the amplitude the
-    episode actually reached — the number that answers "is the motion big
-    enough?".
+    ``2·roll·sin(2πφ)``, registered with ``reduce="mean"`` — the episode average
+    of that product IS the fundamental component of the trunk roll that is in
+    phase with the commanded sinusoid, which is what "how big is the sway"
+    means.
+
+    Why not (max−min)/2: that number is set by a single outlier. The first run
+    reported 20.6° against a 12° reference while the mean tracking error was only
+    3.2° — one bad excursion was inflating the headline figure. The projection
+    also drops the rolling-extremes accumulator, so this is less code.
     """
+    command = env.command_manager.get_command(command_name)
+    assert command is not None, f"Command '{command_name}' not found."
     asset: Entity = env.scene[asset_cfg.name]
-    roll = _march_trunk_roll(asset)
-    step = int(env.common_step_counter)
-    if step != env._march_extrema_step:
-        env._march_roll_lo = torch.minimum(env._march_roll_lo, roll)
-        env._march_roll_hi = torch.maximum(env._march_roll_hi, roll)
-        env._march_extrema_step = step
-    return 0.5 * (env._march_roll_hi - env._march_roll_lo) * _DEG
+    reference_shape = torch.sin(2.0 * math.pi * bounce_phase(command))
+    return 2.0 * _bounce_trunk_roll(asset) * reference_shape * _DEG
 
 
-def march_metric_roll_error_deg(
+def bounce_metric_roll_error_deg(
     env: ManagerBasedRlEnv,
     command_name: str,
     amplitude: float,
@@ -5292,21 +5361,21 @@ def march_metric_roll_error_deg(
     """|actual − commanded roll| in degrees (per-step average)."""
     command = env.command_manager.get_command(command_name)
     asset: Entity = env.scene[asset_cfg.name]
-    reference = march_roll_reference(march_phase(command), amplitude)
-    return (_march_trunk_roll(asset) - reference).abs() * _DEG
+    reference = bounce_roll_reference(bounce_phase(command), amplitude)
+    return (_bounce_trunk_roll(asset) - reference).abs() * _DEG
 
 
-def march_metric_roll_ref_deg(
+def bounce_metric_roll_ref_deg(
     env: ManagerBasedRlEnv,
     command_name: str,
     amplitude: float,
 ) -> torch.Tensor:
     """The commanded roll at the current phase (degrees, + = lean left)."""
     command = env.command_manager.get_command(command_name)
-    return march_roll_reference(march_phase(command), amplitude) * _DEG
+    return bounce_roll_reference(bounce_phase(command), amplitude) * _DEG
 
 
-def march_metric_foot_air_frac(
+def bounce_metric_foot_air_frac(
     env: ManagerBasedRlEnv,
     sensor_name: str,
     foot: int,
@@ -5319,15 +5388,15 @@ def march_metric_foot_air_frac(
     return (air_time[:, foot] > 0.0).to(torch.float32)
 
 
-def march_metric_drift_m(
+def bounce_metric_drift_m(
     env: ManagerBasedRlEnv,
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
-    """Distance of the trunk from where the march started (m)."""
-    return _march_drift(env, env.scene[asset_cfg.name])
+    """Distance of the trunk from where the bounce started (m)."""
+    return _bounce_drift(env, env.scene[asset_cfg.name])
 
 
-def march_metric_pitch_deg(
+def bounce_metric_pitch_deg(
     env: ManagerBasedRlEnv,
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
@@ -5337,7 +5406,7 @@ def march_metric_pitch_deg(
     return torch.asin(g[:, 0].clamp(-1.0, 1.0)) * _DEG
 
 
-def march_print_episode_diagnostics(
+def bounce_print_episode_diagnostics(
     env: ManagerBasedRlEnv,
     env_ids: torch.Tensor | slice | None = None,
 ) -> None:
@@ -5357,17 +5426,17 @@ def march_print_episode_diagnostics(
             for name, values in env.metrics_manager.get_active_iterable_terms(index)
         }
         print(
-            "[march] env %02d | sway %5.1f° (ref %5.1f°, err %5.1f°) "
+            "[bounce] env %02d | sway %5.1f° (ref %5.1f°, err %5.1f°) "
             "| foot air L %.2f R %.2f | drift %+.3f m | pitch %+5.1f°"
             % (
                 index,
-                terms.get("march_sway_amp_deg", nan),
-                terms.get("march_roll_ref_deg", nan),
-                terms.get("march_roll_error_deg", nan),
-                terms.get("march_left_air_frac", nan),
-                terms.get("march_right_air_frac", nan),
-                terms.get("march_drift_m", nan),
-                terms.get("march_pitch_deg", nan),
+                terms.get("bounce_sway_amp_deg", nan),
+                terms.get("bounce_roll_ref_deg", nan),
+                terms.get("bounce_roll_error_deg", nan),
+                terms.get("bounce_left_air_frac", nan),
+                terms.get("bounce_right_air_frac", nan),
+                terms.get("bounce_drift_m", nan),
+                terms.get("bounce_pitch_deg", nan),
             ),
             flush=True,
         )
