@@ -5038,7 +5038,9 @@ DANCE_TURN_SIGN_CW: float = -1.0
 # (the live path reads `DanceTurnVelocityCommand.turn_target_angle` instead).
 # They must match microduck_dance_env_cfg.py.
 _DANCE_TURN_DEFAULTS = dict(
-    turn_speed=4.0 * math.pi / 16.0,
+    # Mirrors microduck_dance_env_cfg.DANCE_TURN_SPEED (one revolution in 11 s,
+    # slowed from 8 s on 2026-10-01); tests/test_dance_cfg.py asserts they match.
+    turn_speed=2.0 * math.pi / 11.0,
     ramp_s=0.5,
     turn_angle=2.0 * math.pi,
     settle_s=2.0,
@@ -5174,6 +5176,92 @@ class DanceTurnVelocityCommand(UniformVelocityCommand):
 
     def _update_metrics(self) -> None:
         pass
+
+    # ---- scene overlay -----------------------------------------------------
+    # Enabled with `debug_vis=True` on the command cfg (set in the dance env
+    # cfg). Native viewer: press R to toggle.
+    #
+    # GEOMETRY ONLY, deliberately: both viewer backends drop the `label=`
+    # argument (`del label` in mjlab's native and viser visualizers), so there
+    # is no text HUD to hook. The numbers live in `Episode_Metrics/dance_*`
+    # (wandb) and, in play mode, on the console via the reset event
+    # `dance_print_episode_diagnostics`.
+    def _debug_vis_impl(self, visualizer) -> None:
+        """Draw the dance start, the drift, and heading vs commanded heading.
+
+        Grey sphere = where the robot started; orange arrow = how far it has
+        drifted from there; blue arrow = where the trunk points now; green
+        arrow = where the cycle is asking it to point. Blue on green = tracking;
+        a growing orange arrow = it is translating instead of pivoting.
+        Everything is in the world coordinates of the environment displayed.
+        """
+        env_indices = list(visualizer.get_env_indices(self.num_envs))
+        if not env_indices:
+            return
+
+        env = self._env
+        origin_pos = getattr(env, "_dance_origin_pos", None)
+        origin_quat = getattr(env, "_dance_origin_quat", None)
+        if origin_pos is None or origin_quat is None:
+            return  # before the first reset
+        accum = getattr(env, "_dance_turn_accum", None)
+        if accum is None:
+            accum = torch.zeros(self.num_envs, device=self.device)
+
+        pos = self.robot.data.root_link_pos_w
+        body_x = torch.zeros_like(pos)
+        body_x[:, 0] = 1.0
+        # Current trunk heading, and the heading the cycle is asking for
+        # (start heading rotated by the commanded rotation).
+        head_x = quat_apply(self.robot.data.root_link_quat_w, body_x)
+        start_x = quat_apply(origin_quat, body_x)
+        cos_t = torch.cos(self.turn_target_angle)
+        sin_t = torch.sin(self.turn_target_angle)
+        target_x = torch.stack(
+            (
+                start_x[:, 0] * cos_t - start_x[:, 1] * sin_t,
+                start_x[:, 0] * sin_t + start_x[:, 1] * cos_t,
+                torch.zeros_like(cos_t),
+            ),
+            dim=-1,
+        )
+
+        for i in env_indices:
+            start = origin_pos[i].detach().cpu().numpy()
+            now = pos[i].detach().cpu().numpy()
+            head = head_x[i].detach().cpu().numpy()
+            target = target_x[i].detach().cpu().numpy()
+            drift = float(torch.linalg.norm(pos[i] - origin_pos[i]).cpu())
+            rot_deg = float(accum[i].cpu()) * _DEG
+            tgt_deg = float(self.turn_target_angle[i].cpu()) * _DEG
+
+            visualizer.add_sphere(
+                start, 0.008, (0.15, 0.15, 0.15, 0.7), label="dance start"
+            )
+            visualizer.add_arrow(
+                start,
+                now,
+                (0.9, 0.4, 0.1, 0.8),
+                0.004,
+                label=f"drift {drift * 1000.0:+.0f} mm",
+            )
+            visualizer.add_arrow(
+                now,
+                now + 0.10 * head,
+                (0.1, 0.3, 0.9, 0.9),
+                0.006,
+                label="trunk heading",
+            )
+            visualizer.add_arrow(
+                now,
+                now + 0.10 * target,
+                (0.1, 0.8, 0.2, 0.9),
+                0.006,
+                label=(
+                    f"rot {rot_deg:+.0f}° (target {tgt_deg:+.0f}°, "
+                    f"err {rot_deg - tgt_deg:+.0f}°)"
+                ),
+            )
 
 
 @_dataclass(kw_only=True)
@@ -5350,6 +5438,19 @@ def _dance_planar_drift(
     asset: Entity,
 ) -> torch.Tensor:
     """Horizontal distance (m) of the trunk from its dance-start position."""
+    dx, dy = _dance_planar_drift_xy(env, asset)
+    return torch.sqrt(dx * dx + dy * dy)
+
+
+def _dance_planar_drift_xy(
+    env: ManagerBasedRlEnv,
+    asset: Entity,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Signed trunk drift from the dance start, in the dance-local frame.
+
+    ``x`` = forward at dance start, ``y`` = left at dance start, so a backwards
+    creep reads as negative x regardless of how far the body has turned.
+    """
     delta = asset.data.root_link_pos_w - env._dance_origin_pos
     body_x = torch.zeros_like(delta)
     body_x[:, 0] = 1.0
@@ -5357,7 +5458,183 @@ def _dance_planar_drift(
     body_y = torch.zeros_like(delta)
     body_y[:, 1] = 1.0
     dy = (delta * quat_apply(env._dance_origin_quat, body_y)).sum(dim=-1)
-    return torch.sqrt(dx * dx + dy * dy)
+    return dx, dy
+
+
+# --------------------------------------------------------------------------- #
+# Dance — diagnostics                                                          #
+# --------------------------------------------------------------------------- #
+#
+# Registered in `cfg.metrics` (mjlab's MetricsManager), so they land in the
+# logger as `Episode_Metrics/<name>` with no reward weight and no dt scaling.
+# `reduce="last"` reports the value at the FINAL step of the episode, which is
+# what "how far did it actually rotate this episode" means; `reduce="mean"`
+# is used for the tilt/rate diagnostics. The live per-env values are also on
+# `env._dance_turn_accum` / `env._dance_origin_*` for the scene overlay.
+_DEG = 180.0 / math.pi
+
+
+def dance_metric_rotation_deg(
+    env: ManagerBasedRlEnv,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Trunk rotation accumulated since the start of the episode (degrees).
+
+    Signed with the ω_z convention: a completed CLOCKWISE revolution reads
+    −360. This is the measured quantity — not the commanded one.
+    """
+    asset: Entity = env.scene[asset_cfg.name]
+    _update_dance_turn_accum(env, asset)
+    return env._dance_turn_accum * _DEG
+
+
+def dance_metric_target_deg(
+    env: ManagerBasedRlEnv,
+    command_name: str = "twist",
+) -> torch.Tensor:
+    """Rotation the cycle has asked for by now (degrees, signed)."""
+    return dance_turn_target_angle(env, command_name) * _DEG
+
+
+def dance_metric_rotation_error_deg(
+    env: ManagerBasedRlEnv,
+    command_name: str = "twist",
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Measured − commanded rotation (degrees). Negative = under-rotated."""
+    asset: Entity = env.scene[asset_cfg.name]
+    _update_dance_turn_accum(env, asset)
+    return (env._dance_turn_accum - dance_turn_target_angle(env, command_name)) * _DEG
+
+
+def dance_metric_drift_x_m(
+    env: ManagerBasedRlEnv,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Trunk drift along the dance-local x axis (m). Negative = walked backwards."""
+    asset: Entity = env.scene[asset_cfg.name]
+    return _dance_planar_drift_xy(env, asset)[0]
+
+
+def dance_metric_drift_y_m(
+    env: ManagerBasedRlEnv,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Trunk drift along the dance-local y axis (m). Positive = walked left."""
+    asset: Entity = env.scene[asset_cfg.name]
+    return _dance_planar_drift_xy(env, asset)[1]
+
+
+def dance_metric_drift_m(
+    env: ManagerBasedRlEnv,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Distance of the trunk from the dance start (m)."""
+    asset: Entity = env.scene[asset_cfg.name]
+    return _dance_planar_drift(env, asset)
+
+
+def dance_metric_pitch_deg(
+    env: ManagerBasedRlEnv,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Trunk pitch from projected gravity (degrees).
+
+    ``asin(g_x)``: positive = nose-down / leaning FORWARD, negative = leaning
+    BACKWARD. This is the number that says whether the "向后倒" is real.
+    """
+    asset: Entity = env.scene[asset_cfg.name]
+    g = torch.nan_to_num(asset.data.projected_gravity_b, nan=0.0)
+    return torch.asin(g[:, 0].clamp(-1.0, 1.0)) * _DEG
+
+
+def dance_metric_roll_deg(
+    env: ManagerBasedRlEnv,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Trunk roll from projected gravity (degrees). Positive = leaning left."""
+    asset: Entity = env.scene[asset_cfg.name]
+    g = torch.nan_to_num(asset.data.projected_gravity_b, nan=0.0)
+    return torch.atan2(-g[:, 1], -g[:, 2]) * _DEG
+
+
+def dance_metric_yaw_rate(
+    env: ManagerBasedRlEnv,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Trunk yaw rate in the body frame (rad/s). Negative = clockwise."""
+    asset: Entity = env.scene[asset_cfg.name]
+    return torch.nan_to_num(asset.data.root_link_ang_vel_b[:, 2], nan=0.0)
+
+
+def dance_metric_head_excursion_deg(
+    env: ManagerBasedRlEnv,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Mean |head joint − HOME| over the four head/neck joints (degrees).
+
+    MEASUREMENT ONLY (no reward weight). It answers the question "is the head
+    moving at all?" — the 2026-10-01 run looked stiff, and this number says
+    whether the policy is using the head or parking it at HOME. If it stays
+    near zero, the head cannot be helping balance no matter what is measured
+    elsewhere; that is the trigger for the head-assist work, not a reward to
+    add now.
+    """
+    asset: Entity = env.scene[asset_cfg.name]
+    ids = []
+    for pattern in (r".*neck_pitch.*", r".*head_pitch.*", r".*head_yaw.*", r".*head_roll.*"):
+        found, _ = asset.find_joints_by_actuator_names([pattern])
+        if len(found) != 1:
+            raise RuntimeError(f"Expected exactly one joint matching {pattern}.")
+        ids.append(found[0])
+    index = torch.tensor(ids, device=env.device, dtype=torch.long)
+    deviation = (
+        asset.data.joint_pos[:, index] - asset.data.default_joint_pos[:, index]
+    ).abs()
+    return deviation.mean(dim=-1) * _DEG
+
+
+def dance_print_episode_diagnostics(
+    env: ManagerBasedRlEnv,
+    env_ids: torch.Tensor | slice | None = None,
+) -> None:
+    """Print a one-line end-of-episode summary of the dance diagnostics.
+
+    Wired as a reset event ONLY in play mode (training would spam: with 4096
+    envs and ~575-step episodes a handful of envs finish every single step).
+
+    The numbers are read from the metrics manager's cache, not from the live
+    tensors: by the time a reset event runs `sim.reset` has already jumped the
+    robot to its new spawn state, so `_dance_turn_accum` has been zeroed and the
+    pose is the new one. The metrics cache still holds the final step of the
+    episode that just ended.
+    """
+    if env_ids is None or isinstance(env_ids, slice):
+        env_ids = torch.arange(env.num_envs, device=env.device, dtype=torch.long)
+    if len(env_ids) == 0 or not hasattr(env, "metrics_manager"):
+        return
+
+    nan = float("nan")
+    for index in (int(i) for i in env_ids):
+        terms = {
+            name: values[0]
+            for name, values in env.metrics_manager.get_active_iterable_terms(index)
+        }
+        print(
+            "[dance] env %02d | rot %+7.1f° (target %+7.1f°, err %+7.1f°) "
+            "| drift x %+6.3f m y %+6.3f m | pitch %+5.1f° roll %+5.1f°"
+            % (
+                index,
+                terms.get("dance_rotation_deg", nan),
+                terms.get("dance_target_deg", nan),
+                terms.get("dance_rotation_error_deg", nan),
+                terms.get("dance_drift_x_m", nan),
+                terms.get("dance_drift_y_m", nan),
+                terms.get("dance_pitch_deg", nan),
+                terms.get("dance_roll_deg", nan),
+            ),
+            flush=True,
+        )
 
 
 def dance_stay_in_place(
