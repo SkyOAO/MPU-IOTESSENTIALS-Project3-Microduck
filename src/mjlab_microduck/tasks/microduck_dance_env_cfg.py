@@ -1,26 +1,21 @@
-"""Microduck bounce-and-turn (dance) task.
+"""Microduck bounce (dance) task.
 
-Episodic phase policy: an exaggerated bouncy weight shift — the feet leave the
-ground, the body leans left with the right foot up, then right with the left foot
-up — WHILE turning one clockwise revolution. One bounce cycle
-(``BOUNCE_PERIOD_S``):
+Episodic phase policy: an exaggerated bouncy weight shift in place — the feet
+leave the ground, the body leans left with the right foot up, then right with the
+left foot up. One bounce cycle (``BOUNCE_PERIOD_S``):
 
     φ ∈ [0.00, 0.50)   trunk leans LEFT, the RIGHT foot is the one that lifts
     φ ∈ [0.50, 1.00)   trunk leans RIGHT, the LEFT foot is the one that lifts
 
-Over the episode the commanded rotation ramps to ``BOUNCE_TURN_DEG`` (360° =
-one clockwise revolution, ending back on the starting heading) in
-``BOUNCE_TURN_S``, then holds through a settle segment.
+Two terms make the move: `bounce_roll_tracking` (sway) and `bounce_lift_tracking`
+(foot lift). Everything else is a stock regulariser or containment ("do not
+travel / do not tip over"). Phase travels in the twist slot as
+``[cos(2πφ), sin(2πφ), 0]``, the runtime one-shot contract, so
+`GroundPickPhaseCommand` is reused unchanged.
 
-Three terms make the move: `bounce_roll_tracking` (sway), `bounce_lift_tracking`
-(foot lift) and `bounce_turn_rate_tracking` (the revolution). Everything else is
-a stock regulariser or containment ("do not travel / do not tip over"). Phase
-travels in the twist slot as ``[cos(2πφ), sin(2πφ), 0]``, the runtime one-shot
-contract, so `GroundPickPhaseCommand` is reused unchanged.
-
-Key metrics: `bounce_sway_amp_deg` (is the sway big enough), `bounce_yaw_total_deg`
-(did it turn one revolution), `bounce_turn_error_deg` (≈ 0), `bounce_yaw_path_deg`
-(net/path tells a clean turn from yaw wobble).
+The commanded yaw revolution was removed (2026-10-02): the move is a pure
+in-place bounce now. Key metrics: `bounce_sway_amp_deg` (is the sway big
+enough), `bounce_roll_error_deg` (≈ 0), `bounce_drift_m` (did it stay put).
 """
 
 import math
@@ -89,20 +84,8 @@ BASE_ORIENTATION_MAX_ROLL_DEG = 5.0  # ±5° side-to-side tilt at episode start
 # Bounce timing and geometry — one left lean + one right lean per cycle
 BOUNCE_PERIOD_S = 2.0        # 1 s per side: slow enough to read as a sway
 
-# Turn: one clockwise revolution at 45°/s (= 8 s/rev, the speed the earlier
-# dedicated turn task commanded and tracked). TURN_RATE is the knob; the
-# duration is derived so the commanded rotation integrates to exactly
-# BOUNCE_TURN_DEG: integral = rate × (turn_s - ramp_s).
-BOUNCE_TURN_DEG = 360.0                        # one revolution → ends on the start heading
-BOUNCE_TURN_RATE_DEG_S = 45.0                  # peak rate (8.0 s per revolution)
-BOUNCE_TURN_RAMP_S = BOUNCE_PERIOD_S           # one bounce cycle to spin up, one to settle
-BOUNCE_TURN_S = BOUNCE_TURN_DEG / BOUNCE_TURN_RATE_DEG_S + BOUNCE_TURN_RAMP_S  # 10.0 s
-BOUNCE_TURN_SIGN = -1.0                        # clockwise (matches the measured drift)
-BOUNCE_SETTLE_S = 2.0                          # stand on the finish (one cycle)
-# Whole number of bounce cycles, so the phase starts at 0 every episode. Keep it
-# tight: extra settle time is dead time where standing still banks the idle rate
-# reward.
-EPISODE_LENGTH_S = 12.0                        # 10 s turn + 2 s stop (600 steps)
+# Whole number of bounce cycles, so the phase starts at 0 every episode.
+EPISODE_LENGTH_S = 12.0                        # 6 full cycles (600 steps)
 # Target roll at the peak of each stance half. The stance foot's inner edge is
 # at y=+21.2 mm and its centre at +40.7 mm with the CoM 148 mm up, so ~8° is the
 # minimum to unload the other foot and ~15° centres the CoM over it.
@@ -333,9 +316,9 @@ def make_microduck_dance_env_cfg(
         params={"sensor_name": self_collision_cfg.name},
     )
 
-    # --- The move: sway + lift + turn ------------------------------------------
-    # Three terms: sway, foot lift, commanded revolution. The first two are
-    # phase-referenced, so neither can be farmed by standing still.
+    # --- The move: sway + lift -------------------------------------------------
+    # Two terms: sway and foot lift. Both are phase-referenced, so neither can be
+    # farmed by standing still.
     bounce_cmd = {"command_name": "twist"}
 
     cfg.rewards["bounce_roll_tracking"] = RewardTermCfg(
@@ -358,30 +341,6 @@ def make_microduck_dance_env_cfg(
         params={**bounce_cmd, "sensor_name": feet_ground_cfg.name},
     )
 
-    turn_cmd = {"rate_deg_s": BOUNCE_TURN_RATE_DEG_S, "total_deg": BOUNCE_TURN_DEG,
-                "ramp_s": BOUNCE_TURN_RAMP_S, "turn_sign": BOUNCE_TURN_SIGN}
-
-    # Rate tracking, not angle tracking: the obs carries no absolute heading, so
-    # an angle target is only chaseable open-loop and the robot cannot learn to
-    # stop on it (2026-10-02: ran 14 % fast, finished at -501° instead of -360°).
-    # The rate is observable and returns to 0 after the revolution.
-    cfg.rewards["bounce_turn_rate_tracking"] = RewardTermCfg(
-        func=microduck_mdp.bounce_turn_rate_tracking,
-        weight=5.0,
-        params={**turn_cmd, "std": 5.0},  # deg/s; tightened from 8.0 to cut the
-        #                                   rate error that integrates into the
-        #                                   final heading (1000-iter run: 13°/s)
-    )
-    # Slow corrector on the accumulated angle (≤ 0 → POSITIVE weight): the rate
-    # term cannot see accumulated error. Returned in RADIANS so the worst case is
-    # O(1); in degrees it was -216/step and grew with episode time, which paid
-    # the robot to terminate early.
-    cfg.rewards["bounce_turn_angle_l1"] = RewardTermCfg(
-        func=microduck_mdp.bounce_turn_angle_l1,
-        weight=0.3,
-        params=dict(turn_cmd),
-    )
-
     # --- Keep it on the spot, upright, and calm --------------------------------
     # Drift pressure is aimed at the NET drift only: a wide (15 cm) always-on
     # Gaussian that does not fight the ±5 cm sway, plus an L1 gated by
@@ -398,14 +357,17 @@ def make_microduck_dance_env_cfg(
         weight=1.0,
         params=dict(bounce_cmd),
     )
-    # NOTE: `bounce_heading_hold` / `bounce_heading_l1` are gone with their
-    # functions — the move is a COMMANDED revolution now, so penalising deviation
-    # from the start heading would charge the task itself.
-    # (History: at weight 1.5 the L1 was the second-largest cost in the whole
-    # stack -2.21/step ~24 % of the positive mass, and the run with 5-6x that
-    # total pressure turned no less than one with a fifth of it. Paying a lot
-    # for something the policy cannot buy is just advantage noise — hence
-    # measure the turn and command it instead of fighting it.)
+    # NOTE: the commanded yaw revolution (`bounce_turn_rate_tracking` /
+    # `bounce_turn_angle_l1`) and its measurement terms were removed
+    # (2026-10-02) — the move is a pure in-place bounce now.
+    # In their place, one small yaw-RATE containment term stops the body
+    # wandering in heading (ω_z is observable, so it is learnable). Kept well
+    # under the sway/lift weights so the bounce amplitude cannot be traded away
+    # to buy it.
+    cfg.rewards["bounce_yaw_rate_l1"] = RewardTermCfg(
+        func=microduck_mdp.bounce_yaw_rate_l1,
+        weight=0.5,  # ≤ 0 → POSITIVE weight. ~0.2/step at 0.4 rad/s, vs sway 5.0
+    )
     # Balance = pitch only. The stock `upright` penalises roll too, and roll is
     # what this move is asked to produce, so it is replaced rather than tuned.
     cfg.rewards.pop("upright", None)
@@ -495,38 +457,9 @@ def make_microduck_dance_env_cfg(
     cfg.metrics["bounce_pitch_deg"] = MetricsTermCfg(
         func=microduck_mdp.bounce_metric_pitch_deg, reduce="mean"
     )
-    # Rotation: net turn per episode, total |yaw| travelled (net/path tells a
-    # clean turn from wobble) and the signed rate.
-    cfg.metrics["bounce_yaw_total_deg"] = MetricsTermCfg(
-        func=microduck_mdp.bounce_metric_yaw_total_deg, reduce="last"
-    )
-    cfg.metrics["bounce_yaw_path_deg"] = MetricsTermCfg(
-        func=microduck_mdp.bounce_metric_yaw_path_deg, reduce="last"
-    )
+    # Yaw-rate diagnostic: episode-mean signed rate (≈0 = wobble, sign = drift).
     cfg.metrics["bounce_yaw_rate_deg_s"] = MetricsTermCfg(
         func=microduck_mdp.bounce_metric_yaw_rate_deg_s, reduce="mean"
-    )
-    # Measured − commanded at the last step: the pass/fail line, expect ~0.
-    cfg.metrics["bounce_turn_error_deg"] = MetricsTermCfg(
-        func=microduck_mdp.bounce_metric_turn_error_deg,
-        params=dict(
-            rate_deg_s=BOUNCE_TURN_RATE_DEG_S,
-            total_deg=BOUNCE_TURN_DEG,
-            ramp_s=BOUNCE_TURN_RAMP_S,
-            turn_sign=BOUNCE_TURN_SIGN,
-        ),
-        reduce="last",
-    )
-    # The commanded rate; it returns to 0 for the settle segment (the stop).
-    cfg.metrics["bounce_turn_rate_ref_deg_s"] = MetricsTermCfg(
-        func=microduck_mdp.bounce_metric_turn_rate_ref_deg_s,
-        params=dict(
-            rate_deg_s=BOUNCE_TURN_RATE_DEG_S,
-            total_deg=BOUNCE_TURN_DEG,
-            ramp_s=BOUNCE_TURN_RAMP_S,
-            turn_sign=BOUNCE_TURN_SIGN,
-        ),
-        reduce="last",
     )
 
     # Events
