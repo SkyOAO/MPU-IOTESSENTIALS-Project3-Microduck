@@ -5084,13 +5084,21 @@ def bounce_reset_origin(
     env._bounce_origin_pos[env_ids] = asset.data.root_link_pos_w[env_ids]
 
 
+def _bounce_drift_vec(
+    env: ManagerBasedRlEnv,
+    asset: Entity,
+) -> torch.Tensor:
+    """Horizontal trunk displacement (m) from the bounce start, as ``(x, y)``."""
+    return asset.data.root_link_pos_w[:, :2] - env._bounce_origin_pos[:, :2]
+
+
 def _bounce_drift(
     env: ManagerBasedRlEnv,
     asset: Entity,
 ) -> torch.Tensor:
     """Horizontal distance (m) of the trunk from its bounce-start position."""
-    delta = asset.data.root_link_pos_w - env._bounce_origin_pos
-    return torch.sqrt(delta[:, 0] ** 2 + delta[:, 1] ** 2)
+    delta = _bounce_drift_vec(env, asset)
+    return torch.sqrt((delta**2).sum(dim=-1))
 
 
 def bounce_centre_gate(phase: torch.Tensor) -> torch.Tensor:
@@ -5188,28 +5196,40 @@ def bounce_lift_tracking(
 def bounce_stay_in_place(
     env: ManagerBasedRlEnv,
     command_name: str = "twist",
-    std: float = 0.10,
+    std_forward: float = 0.05,
+    std_lateral: float = 0.15,
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
-    """Reward being centred when the sway crosses zero (see bounce_centre_gate)."""
+    """Reward being centred when the sway crosses zero (see bounce_centre_gate).
+
+    Anisotropic on purpose: the sway legitimately moves the trunk a few cm
+    SIDEWAYS, so y stays loose, while forward (x) displacement is never part of
+    the move and is priced ~3x tighter to stop the forward creep.
+    """
     command = env.command_manager.get_command(command_name)
     assert command is not None, f"Command '{command_name}' not found."
     asset: Entity = env.scene[asset_cfg.name]
     centred = bounce_centre_gate(bounce_phase(command))
-    return centred * torch.exp(-(_bounce_drift(env, asset) / std) ** 2)
+    d = _bounce_drift_vec(env, asset)
+    error_sq = (d[:, 0] / std_forward) ** 2 + (d[:, 1] / std_lateral) ** 2
+    return centred * torch.exp(-error_sq)
 
 
 def bounce_stay_in_place_l1(
     env: ManagerBasedRlEnv,
     command_name: str = "twist",
+    forward_gain: float = 3.0,
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
     """Gated L1 companion (≤ 0 → POSITIVE weight): constant gradient on the
-    NET drift, so a robot that has walked off the spot keeps being pulled back."""
+    NET drift, so a robot that has walked off the spot keeps being pulled back.
+    The forward axis is weighted harder — see `bounce_stay_in_place`."""
     command = env.command_manager.get_command(command_name)
     assert command is not None, f"Command '{command_name}' not found."
     asset: Entity = env.scene[asset_cfg.name]
-    return -bounce_centre_gate(bounce_phase(command)) * _bounce_drift(env, asset)
+    d = _bounce_drift_vec(env, asset)
+    priced = torch.sqrt((forward_gain * d[:, 0]) ** 2 + d[:, 1] ** 2)
+    return -bounce_centre_gate(bounce_phase(command)) * priced
 
 
 def bounce_yaw_rate_l1(

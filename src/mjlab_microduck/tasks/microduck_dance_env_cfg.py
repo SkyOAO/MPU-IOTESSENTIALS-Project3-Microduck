@@ -84,8 +84,11 @@ BASE_ORIENTATION_MAX_ROLL_DEG = 5.0  # ±5° side-to-side tilt at episode start
 # Bounce timing and geometry — one left lean + one right lean per cycle
 BOUNCE_PERIOD_S = 2.0        # 1 s per side: slow enough to read as a sway
 
-# Whole number of bounce cycles, so the phase starts at 0 every episode.
-EPISODE_LENGTH_S = 12.0                        # 6 full cycles (600 steps)
+# Whole number of bounce cycles (one cycle = BOUNCE_PERIOD_S = 2 s: lean left,
+# lean right). The bounce is periodic and the turn is gone, so the episode only
+# needs enough cycles to learn the rhythm; previously 12 s (6 cycles) was turn
+# padding. 4 s = 2 cycles.
+EPISODE_LENGTH_S = 6.0                         # 2 full cycles (200 steps)
 # Target roll at the peak of each stance half. The stance foot's inner edge is
 # at y=+21.2 mm and its centre at +40.7 mm with the CoM 148 mm up, so ~8° is the
 # minimum to unload the other foot and ~15° centres the CoM over it.
@@ -342,20 +345,23 @@ def make_microduck_dance_env_cfg(
     )
 
     # --- Keep it on the spot, upright, and calm --------------------------------
-    # Drift pressure is aimed at the NET drift only: a wide (15 cm) always-on
-    # Gaussian that does not fight the ±5 cm sway, plus an L1 gated by
-    # `bounce_centre_gate` (read where the body passes upright over the centre).
+    # Drift pressure is aimed at the NET drift only, and is ANISOTROPIC: the sway
+    # legitimately moves the trunk a few cm sideways (y), so y stays loose
+    # (15 cm) while forward (x) is priced ~3x tighter (5 cm) to kill the forward
+    # creep. Both are gated by `bounce_centre_gate` (read where the body passes
+    # upright over the centre), so the sway itself is never taxed.
     cfg.rewards["bounce_stay_in_place"] = RewardTermCfg(
         func=microduck_mdp.bounce_stay_in_place,
         weight=1.5,
-        params={**bounce_cmd, "std": 0.15},
+        params={**bounce_cmd, "std_forward": 0.05, "std_lateral": 0.15},
     )
     cfg.rewards["bounce_stay_in_place_l1"] = RewardTermCfg(
         func=microduck_mdp.bounce_stay_in_place_l1,
         # 3.0 → 1.0: at 3.0 it was the third-largest cost while the robot still
-        # travelled 1.1 m; kept as a gentle bias only.
+        # travelled 1.1 m; kept as a gentle bias. forward_gain=3 concentrates
+        # what force there is on the axis that actually drifts.
         weight=1.0,
-        params=dict(bounce_cmd),
+        params={**bounce_cmd, "forward_gain": 3.0},
     )
     # NOTE: the commanded yaw revolution (`bounce_turn_rate_tracking` /
     # `bounce_turn_angle_l1`) and its measurement terms were removed

@@ -72,6 +72,39 @@ def test_centre_gate_measures_net_drift_not_the_sway():
     )
 
 
+def test_drift_containment_prices_forward_harder_than_lateral():
+    """Forward creep is the reported failure mode; the sway is lateral. The same
+    10 cm must cost far more in x than in y, so the move is not taxed."""
+    import types
+
+    cfg = make_microduck_dance_env_cfg()
+    term = cfg.rewards["bounce_stay_in_place"]
+    command = torch.tensor([[1.0, 0.0, 0.0]])  # φ = 0 → centre gate = 1
+
+    class _Cmd:
+        def get_command(self, _name):
+            return command
+
+    def score_at(dx: float, dy: float) -> float:
+        env = types.SimpleNamespace(
+            command_manager=_Cmd(),
+            scene={
+                "robot": types.SimpleNamespace(
+                    data=types.SimpleNamespace(
+                        root_link_pos_w=torch.tensor([[dx, dy, 0.15]])
+                    )
+                )
+            },
+        )
+        env._bounce_origin_pos = torch.tensor([[0.0, 0.0, 0.15]])
+        return term.func(env, **term.params).item()
+
+    assert score_at(0.0, 0.0) == pytest.approx(1.0)
+    assert score_at(0.10, 0.0) < 0.10          # forward is nearly zeroed
+    assert score_at(0.0, 0.10) > 0.5           # sideways stays cheap
+    assert score_at(0.10, 0.0) < score_at(0.0, 0.10)
+
+
 def test_lift_term_does_not_require_the_other_foot_planted():
     """The bounce must stay a bounce: only the scheduled foot is graded.
 
@@ -322,12 +355,13 @@ def test_play_mode_prints_per_episode_diagnostics():
     assert "bounce_reset_origin" in train_cfg.events
 
 
-def test_episode_holds_several_bounce_cycles():
+def test_episode_holds_a_whole_number_of_short_bounce_cycles():
     cfg = make_microduck_dance_env_cfg()
     # The move is periodic, so the episode length is simply a whole number of
-    # bounce cycles.
-    assert EPISODE_LENGTH_S == pytest.approx(12.0)
+    # bounce cycles. Kept short: there is no turn/settle padding any more.
+    assert EPISODE_LENGTH_S == pytest.approx(4.0)
     assert cfg.episode_length_s == pytest.approx(EPISODE_LENGTH_S)
+    assert 2 <= EPISODE_LENGTH_S / BOUNCE_PERIOD_S <= 4
     assert EPISODE_LENGTH_S / BOUNCE_PERIOD_S == pytest.approx(
         round(EPISODE_LENGTH_S / BOUNCE_PERIOD_S)
     )
