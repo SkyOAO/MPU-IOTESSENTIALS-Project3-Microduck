@@ -129,7 +129,7 @@ def test_cfg_reuses_the_shared_phase_command():
     assert command.randomize_phase is False
 
 
-def test_turn_budget_is_one_clockwise_revolution_at_the_accidental_speed():
+def test_turn_budget_is_one_clockwise_revolution_at_45_deg_s():
     # One full revolution, so the robot finishes facing the heading it started
     # on. (Three was tried first and made the episode 42 s — too long.)
     assert BOUNCE_TURN_DEG == pytest.approx(360.0)
@@ -138,9 +138,10 @@ def test_turn_budget_is_one_clockwise_revolution_at_the_accidental_speed():
     assert BOUNCE_TURN_S == pytest.approx(
         BOUNCE_TURN_DEG / BOUNCE_TURN_RATE_DEG_S + BOUNCE_TURN_RAMP_S
     )
-    # The speed reference is the ACCIDENTAL turn this task produces on its own
-    # (measured 23.6-24.7°/s); 27°/s is that rate rounded up.
-    assert 24.0 <= BOUNCE_TURN_RATE_DEG_S <= 30.0
+    # 45°/s = one revolution in 8 s: the speed the earlier dedicated turn task
+    # commanded and tracked. Faster than the bounce's own passive drift (~24°/s).
+    assert BOUNCE_TURN_RATE_DEG_S == pytest.approx(45.0)
+    assert BOUNCE_TURN_DEG / BOUNCE_TURN_RATE_DEG_S == pytest.approx(8.0, abs=0.1)
 
 
 def test_turn_schedule_integrates_to_the_requested_degrees():
@@ -166,6 +167,29 @@ def test_turn_schedule_integrates_to_the_requested_degrees():
     assert held.item() == pytest.approx(-BOUNCE_TURN_DEG, abs=1e-6)
 
 
+def test_turn_rate_profile_spins_up_and_returns_to_zero():
+    """The rate command must END at zero: that is the segment that teaches the
+    robot to stop on the target (the angle target alone cannot, because the
+    observation has no yaw)."""
+    kw = dict(
+        rate_deg_s=BOUNCE_TURN_RATE_DEG_S,
+        total_deg=BOUNCE_TURN_DEG,
+        ramp_s=BOUNCE_TURN_RAMP_S,
+        turn_sign=BOUNCE_TURN_SIGN,
+    )
+    t = torch.linspace(0.0, EPISODE_LENGTH_S, 2001)
+    rate = microduck_mdp.bounce_turn_rate_ref_deg_s(t, **kw)
+
+    assert rate[0].item() == pytest.approx(0.0, abs=1e-9)
+    assert rate.min().item() == pytest.approx(-BOUNCE_TURN_RATE_DEG_S, abs=1e-6)
+    # Ramped, not a step: the biggest one-sample jump is far below the peak.
+    assert rate.diff().abs().max().item() < 0.5 * BOUNCE_TURN_RATE_DEG_S
+    # Everything after the turn is a commanded STOP.
+    assert torch.all(rate[t >= BOUNCE_TURN_S] == 0.0)
+    # And the integral is exactly one revolution.
+    assert torch.trapz(rate, t).item() == pytest.approx(-BOUNCE_TURN_DEG, abs=1.0)
+
+
 def test_heading_hold_terms_are_gone():
     """The move is three COMMANDED revolutions: keeping the start-heading pair
     would charge the task itself (~19 rad/step by the last cycle)."""
@@ -182,12 +206,12 @@ def test_the_move_is_three_task_terms():
         BOUNCE_SWAY_AMPLITUDE
     )
     assert cfg.rewards["bounce_lift_tracking"].weight == pytest.approx(3.0)
-    assert cfg.rewards["bounce_turn_tracking"].weight == pytest.approx(5.0)
+    assert cfg.rewards["bounce_turn_rate_tracking"].weight == pytest.approx(5.0)
     # The move (sway + lift + turn, with the stock gait shaping that feeds the
     # bounce) must out-bid everything that only says "do not misbehave".
     smallest_task = min(
         cfg.rewards[n].weight
-        for n in ("bounce_roll_tracking", "bounce_lift_tracking", "bounce_turn_tracking", "air_time")
+        for n in ("bounce_roll_tracking", "bounce_lift_tracking", "bounce_turn_rate_tracking", "air_time")
     )
     largest_containment = max(
         cfg.rewards[n].weight
@@ -195,7 +219,7 @@ def test_the_move_is_three_task_terms():
             "bounce_pitch_balance",
             "bounce_stay_in_place",
             "bounce_stay_in_place_l1",
-            "bounce_turn_l1",
+            "bounce_turn_angle_l1",
             "bounce_roll_l1",
             "pose",
             "bounce_head_hold",
@@ -223,7 +247,7 @@ def test_self_negating_l1_term_keeps_a_positive_weight():
     # `bounce_roll_l1` returns ≤ 0 → POSITIVE weight (a negative weight would
     # double-negate into paying for the violation).
     cfg = make_microduck_dance_env_cfg()
-    for name in ("bounce_roll_l1", "bounce_stay_in_place_l1", "bounce_turn_l1"):
+    for name in ("bounce_roll_l1", "bounce_stay_in_place_l1", "bounce_turn_angle_l1"):
         assert cfg.rewards[name].weight > 0.0, name
 
 
@@ -274,7 +298,6 @@ def test_diagnostics_are_registered_as_episode_metrics():
     expected = {
         # mean of 2·roll·sin(2πφ) = sway amplitude in phase with the reference
         "bounce_sway_amp_deg": "mean",
-        "bounce_roll_ref_deg": "last",
         "bounce_roll_error_deg": "mean",
         "bounce_left_air_frac": "mean",
         "bounce_right_air_frac": "mean",
@@ -285,8 +308,9 @@ def test_diagnostics_are_registered_as_episode_metrics():
         "bounce_yaw_path_deg": "last",
         "bounce_yaw_rate_deg_s": "mean",
         # Commanded rotation and the pass/fail line (measured − commanded).
-        "bounce_turn_target_deg": "last",
         "bounce_turn_error_deg": "last",
+        # Commanded yaw RATE: returns to 0 at the end (the stop segment).
+        "bounce_turn_rate_ref_deg_s": "last",
     }
     for name, reduce in expected.items():
         assert name in cfg.metrics, name
@@ -314,31 +338,26 @@ def test_every_registered_term_takes_env_as_its_first_parameter():
             assert first == "env", f"{kind} '{name}' must take env first, got {first!r}"
 
 
-def test_turn_target_metric_is_callable_the_way_mjlab_calls_it():
-    """Call the registered wrapper exactly as the metrics manager does.
+def test_turn_rate_metric_is_callable_the_way_mjlab_calls_it():
+    """Call a registered wrapper exactly as the metrics manager does.
 
     The static audit above can be satisfied by a wrapper that still crashes
-    inside; this actually runs it against a stub env.
+    inside; this runs one against a stub env.
     """
     import types
 
     cfg = make_microduck_dance_env_cfg()
-    term = cfg.metrics["bounce_turn_target_deg"]
-    env = types.SimpleNamespace(
-        num_envs=2,
-        device=torch.device("cpu"),
-        episode_length_buf=torch.zeros(2, dtype=torch.long),
-        step_dt=0.02,
-    )
+    term = cfg.metrics["bounce_turn_rate_ref_deg_s"]
+    env = types.SimpleNamespace(num_envs=2, device=torch.device("cpu"), step_dt=0.02)
     value = term.func(env, **term.params)
     assert value.shape == (2,)
-    assert value[0].item() == pytest.approx(0.0, abs=1e-6)
+    assert value[0].item() == pytest.approx(0.0, abs=1e-6)  # rate starts at 0
 
-    # Half way through the turn it must be a real fraction of the target.
-    # NB: the clock is our own step counter, not `episode_length_buf`.
-    env._bounce_step_count = torch.full((2,), int(7.0 / 0.02), dtype=torch.long)
+    # Mid-turn it must be the full commanded rate; the clock is our own step
+    # counter, not `episode_length_buf`.
+    env._bounce_step_count = torch.full((2,), int(5.0 / 0.02), dtype=torch.long)
     value = term.func(env, **term.params)
-    assert -BOUNCE_TURN_DEG < value[0].item() < 0.0
+    assert value[0].item() == pytest.approx(-BOUNCE_TURN_RATE_DEG_S, abs=1e-3)
 
 
 def test_turn_clock_ignores_the_randomized_episode_length_buffer():
@@ -367,7 +386,7 @@ def test_l1_penalties_stay_O_of_one():
     import types
 
     cfg = make_microduck_dance_env_cfg()
-    term = cfg.rewards["bounce_turn_l1"]
+    term = cfg.rewards["bounce_turn_angle_l1"]
     # Worst case: the robot has not turned at all while the target is complete.
     env = types.SimpleNamespace(
         num_envs=1,
@@ -395,7 +414,7 @@ def test_episode_holds_several_bounce_cycles():
     cfg = make_microduck_dance_env_cfg()
     # One revolution at the accidental speed, plus the settle, plus a little
     # margin. The episode must outlast the turn or the finish never trains.
-    assert EPISODE_LENGTH_S == pytest.approx(18.0)
+    assert EPISODE_LENGTH_S == pytest.approx(12.0)
     assert EPISODE_LENGTH_S > BOUNCE_TURN_S
     assert EPISODE_LENGTH_S - BOUNCE_TURN_S >= BOUNCE_SETTLE_S
     assert cfg.episode_length_s == pytest.approx(EPISODE_LENGTH_S)
