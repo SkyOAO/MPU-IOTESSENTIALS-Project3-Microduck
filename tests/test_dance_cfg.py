@@ -105,33 +105,51 @@ def test_drift_containment_prices_forward_harder_than_lateral():
     assert score_at(0.10, 0.0) < score_at(0.0, 0.10)
 
 
-def test_lift_term_does_not_require_the_other_foot_planted():
-    """The bounce must stay a bounce: only the scheduled foot is graded.
+def test_lift_window_is_open_only_at_each_foot_s_sway_peak():
+    phase = torch.tensor([0.0, 0.25, 0.5, 0.75])
+    window = microduck_mdp.bounce_lift_window(phase, half_width=0.15)
+    # columns are (LEFT, RIGHT): hand-overs are closed, peaks open one side.
+    assert window.tolist() == [[0.0, 0.0], [0.0, 1.0], [0.0, 0.0], [1.0, 0.0]]
 
-    Regression guard for the requirement "就是要类似原地弹跳这种的": if this term
-    ever starts rewarding the other foot being DOWN, the both-feet-airborne
-    bounce disappears.
-    """
+
+def test_lift_term_requires_flight_inside_the_window():
+    """The bounce must stay a bounce (both feet may leave together) but ONLY at
+    the sway peak: the per-step lift reward used to be farmable by keeping the
+    feet airborne the whole episode (`foot air L 1.00 R 1.00`)."""
     import types
 
-    command = torch.tensor([[1.0, 0.0, 0.0]])  # φ = 0 → RIGHT should be up
+    def score(phase: float, air_left: float, air_right: float) -> float:
+        # φ = 0 → cos = 1, sin = 0; φ = 0.25 → cos = 0, sin = 1.
+        command = torch.tensor(
+            [[math.cos(2 * math.pi * phase), math.sin(2 * math.pi * phase), 0.0]]
+        )
 
-    class _Cmd:
-        def get_command(self, _name):
-            return command
+        class _Cmd:
+            def get_command(self, _name):
+                return command
 
-    class _Sensor:
-        class data:
-            # BOTH feet off the ground — should still score 1.0.
-            current_air_time = torch.tensor([[0.20, 0.20]])
+        class _Sensor:
+            class data:
+                current_air_time = torch.tensor([[air_left, air_right]])
 
-    env = types.SimpleNamespace(
-        command_manager=_Cmd(), scene={"feet_ground_contact": _Sensor()}
-    )
-    score = microduck_mdp.bounce_lift_tracking(
-        env, command_name="twist", sensor_name="feet_ground_contact"
-    )
-    assert score.item() == pytest.approx(1.0)
+        env = types.SimpleNamespace(
+            command_manager=_Cmd(), scene={"feet_ground_contact": _Sensor()}
+        )
+        return microduck_mdp.bounce_lift_tracking(
+            env,
+            command_name="twist",
+            sensor_name="feet_ground_contact",
+            half_width=0.15,
+            off_window_penalty=0.5,
+        ).item()
+
+    # At the RIGHT foot's peak (φ=0.25) both feet may be up → full credit.
+    assert score(0.25, 0.20, 0.20) == pytest.approx(1.0)
+    assert score(0.25, 0.00, 0.20) == pytest.approx(1.0)  # other foot planted
+    assert score(0.25, 0.20, 0.00) == pytest.approx(0.0)  # scheduled foot down
+    # At the hand-over (φ=0) BOTH feet must be planted; flight is charged.
+    assert score(0.0, 0.20, 0.20) == pytest.approx(-0.5)
+    assert score(0.0, 0.00, 0.00) == pytest.approx(0.0)
 
 
 def test_sway_amplitude_is_large_enough_to_unload_a_foot():
@@ -347,21 +365,22 @@ def test_yaw_rate_term_is_a_nonpositive_penalty():
     assert value_for(-0.9) == pytest.approx(-0.9)
 
 
-def test_play_mode_prints_per_episode_diagnostics():
+def test_play_mode_does_not_print_per_episode_diagnostics():
     train_cfg = make_microduck_dance_env_cfg(play=False)
     play_cfg = make_microduck_dance_env_cfg(play=True)
     assert "bounce_print_diagnostics" not in train_cfg.events
-    assert "bounce_print_diagnostics" in play_cfg.events
+    assert "bounce_print_diagnostics" not in play_cfg.events
+    assert not hasattr(microduck_mdp, "bounce_print_episode_diagnostics")
     assert "bounce_reset_origin" in train_cfg.events
 
 
 def test_episode_holds_a_whole_number_of_short_bounce_cycles():
     cfg = make_microduck_dance_env_cfg()
-    # The move is periodic, so the episode length is simply a whole number of
-    # bounce cycles. Kept short: there is no turn/settle padding any more.
-    assert EPISODE_LENGTH_S == pytest.approx(4.0)
+    # 3 s = 3 bounces of 1 s each; the move is periodic so that is all it needs.
+    assert BOUNCE_PERIOD_S == pytest.approx(1.0)
+    assert EPISODE_LENGTH_S == pytest.approx(3.0)
+    assert EPISODE_LENGTH_S / BOUNCE_PERIOD_S == pytest.approx(3.0)
     assert cfg.episode_length_s == pytest.approx(EPISODE_LENGTH_S)
-    assert 2 <= EPISODE_LENGTH_S / BOUNCE_PERIOD_S <= 4
     assert EPISODE_LENGTH_S / BOUNCE_PERIOD_S == pytest.approx(
         round(EPISODE_LENGTH_S / BOUNCE_PERIOD_S)
     )

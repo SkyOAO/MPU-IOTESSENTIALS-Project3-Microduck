@@ -5122,6 +5122,27 @@ def bounce_lift_schedule(phase: torch.Tensor) -> torch.Tensor:
     return torch.stack((left_up, right_up), dim=-1)
 
 
+def _bounce_phase_in_window(
+    phase: torch.Tensor, centre: float, half_width: float
+) -> torch.Tensor:
+    """1 where φ lies within ``±half_width`` of ``centre`` on the circular phase."""
+    delta = (phase - centre + 0.5) % 1.0 - 0.5
+    return (delta.abs() <= half_width).to(phase.dtype)
+
+
+def bounce_lift_window(phase: torch.Tensor, half_width: float) -> torch.Tensor:
+    """``[N, 2]`` of (LEFT, RIGHT): is that foot's flight window open?
+
+    A foot may only be off the ground near its own sway peak — RIGHT around
+    φ=0.25 (the body leans left, unloading the right foot), LEFT around φ=0.75.
+    Between windows the robot MUST be planted; that is what bounds the move to
+    one lift per half-cycle instead of a free-running flutter.
+    """
+    right_open = _bounce_phase_in_window(phase, 0.25, half_width)
+    left_open = _bounce_phase_in_window(phase, 0.75, half_width)
+    return torch.stack((left_open, right_open), dim=-1)
+
+
 # --------------------------------------------------------------------------- #
 # Bounce — the two task terms                                                   #
 # --------------------------------------------------------------------------- #
@@ -5167,16 +5188,25 @@ def bounce_lift_tracking(
     env: ManagerBasedRlEnv,
     command_name: str,
     sensor_name: str,
+    half_width: float = 0.15,
+    off_window_penalty: float = 0.5,
 ) -> torch.Tensor:
-    """The scheduled foot is OFF the ground (RIGHT first half, LEFT second).
+    """The scheduled foot is OFF the ground, ONLY inside its flight window.
 
-    Only the lift is priced, never the plant: both feet airborne together is part
-    of the bounce (accepted runs sit at ~0.65 foot-air fractions). The stock
-    `feet_air_time` shapes how long/high each lift is.
+    +1 when the scheduled foot is up near its sway peak; −``off_window_penalty``
+    whenever ANY foot is up outside both windows. The body must be planted at the
+    hand-overs, so the move is one bounded hop per half-cycle — without this the
+    per-step lift reward is farmed by keeping the feet airborne continuously
+    (2026-10-02: `foot air L 1.00 R 1.00`, sway 0.3°, drift 0.74 m).
+
+    The other foot may be up too WHILE the window is open (both feet leaving the
+    ground together is the bounce); it is never graded otherwise.
     """
     command = env.command_manager.get_command(command_name)
     assert command is not None, f"Command '{command_name}' not found."
-    schedule = bounce_lift_schedule(bounce_phase(command))
+    phase = bounce_phase(command)
+    window = bounce_lift_window(phase, half_width)
+    schedule = bounce_lift_schedule(phase)
     air_time = env.scene[sensor_name].data.current_air_time
     assert air_time is not None, f"Sensor '{sensor_name}' has no air-time field."
     airborne = torch.stack(
@@ -5186,8 +5216,10 @@ def bounce_lift_tracking(
         ),
         dim=-1,
     )
-    # 1 when the scheduled foot is up; what the other foot does is not graded.
-    return (schedule * airborne).sum(dim=-1)
+    window_open = window.max(dim=-1).values
+    credit = window_open * (schedule * airborne).sum(dim=-1)
+    any_airborne = airborne.max(dim=-1).values
+    return credit - off_window_penalty * (1.0 - window_open) * any_airborne
 
 
 # --------------------------------------------------------------------------- #
@@ -5367,41 +5399,6 @@ def bounce_metric_yaw_rate_deg_s(
     asset: Entity = env.scene[asset_cfg.name]
     rate = torch.nan_to_num(asset.data.root_link_ang_vel_b[:, 2], nan=0.0)
     return rate * _DEG
-
-
-def bounce_print_episode_diagnostics(
-    env: ManagerBasedRlEnv,
-    env_ids: torch.Tensor | slice | None = None,
-) -> None:
-    """One console line per finished episode (play mode only).
-
-    Reads the metrics cache, not live tensors: by reset time `sim.reset` has
-    already moved the robot to its new spawn state.
-    """
-    if env_ids is None or isinstance(env_ids, slice):
-        env_ids = torch.arange(env.num_envs, device=env.device, dtype=torch.long)
-    if len(env_ids) == 0 or not hasattr(env, "metrics_manager"):
-        return
-    nan = float("nan")
-    for index in (int(i) for i in env_ids):
-        terms = {
-            name: values[0]
-            for name, values in env.metrics_manager.get_active_iterable_terms(index)
-        }
-        print(
-            "[bounce] env %02d | sway %5.1f° (err %5.1f°) "
-            "| foot air L %.2f R %.2f | drift %+.3f m | pitch %+5.1f°"
-            % (
-                index,
-                terms.get("bounce_sway_amp_deg", nan),
-                terms.get("bounce_roll_error_deg", nan),
-                terms.get("bounce_left_air_frac", nan),
-                terms.get("bounce_right_air_frac", nan),
-                terms.get("bounce_drift_m", nan),
-                terms.get("bounce_pitch_deg", nan),
-            ),
-            flush=True,
-        )
 
 
 # --------------------------------------------------------------------------- #

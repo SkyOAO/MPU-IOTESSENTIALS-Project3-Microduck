@@ -82,13 +82,19 @@ BASE_ORIENTATION_MAX_PITCH_DEG = 10.0  # ±10° forward/backward tilt at episode
 BASE_ORIENTATION_MAX_ROLL_DEG = 5.0  # ±5° side-to-side tilt at episode start
 
 # Bounce timing and geometry — one left lean + one right lean per cycle
-BOUNCE_PERIOD_S = 2.0        # 1 s per side: slow enough to read as a sway
+BOUNCE_PERIOD_S = 1.0        # 0.5 s per side: one full bounce per second
 
-# Whole number of bounce cycles (one cycle = BOUNCE_PERIOD_S = 2 s: lean left,
-# lean right). The bounce is periodic and the turn is gone, so the episode only
-# needs enough cycles to learn the rhythm; previously 12 s (6 cycles) was turn
-# padding. 4 s = 2 cycles.
-EPISODE_LENGTH_S = 6.0                         # 2 full cycles (200 steps)
+# 3 s = 3 full bounce cycles. The move is periodic, so the episode is just the
+# cycle count the trick wants (previously 12 s was turn padding).
+EPISODE_LENGTH_S = 3.0                         # 3 full cycles (150 steps @50 Hz)
+
+# A foot may only be off the ground near its own sway peak (RIGHT at φ=0.25,
+# LEFT at φ=0.75); this is ±0.15 of the cycle ≈ ±0.15 s around the peak. Without
+# it the per-step lift reward is farmed by continuously flapping the feet
+# (2026-10-02: `foot air L 1.00 R 1.00`). `OFF_WINDOW_PENALTY` is the penalty
+# applied per step while ANY foot is airborne outside both windows.
+BOUNCE_LIFT_WINDOW = 0.15
+BOUNCE_OFF_WINDOW_PENALTY = 0.5
 # Target roll at the peak of each stance half. The stance foot's inner edge is
 # at y=+21.2 mm and its centre at +40.7 mm with the CoM 148 mm up, so ~8° is the
 # minimum to unload the other foot and ~15° centres the CoM over it.
@@ -341,7 +347,14 @@ def make_microduck_dance_env_cfg(
     cfg.rewards["bounce_lift_tracking"] = RewardTermCfg(
         func=microduck_mdp.bounce_lift_tracking,
         weight=3.0,
-        params={**bounce_cmd, "sensor_name": feet_ground_cfg.name},
+        params={
+            **bounce_cmd,
+            "sensor_name": feet_ground_cfg.name,
+            # Flight only around the sway peaks, penalty for any foot air
+            # outside them — this is what pins "one bounce per half-cycle".
+            "half_width": BOUNCE_LIFT_WINDOW,
+            "off_window_penalty": BOUNCE_OFF_WINDOW_PENALTY,
+        },
     )
 
     # --- Keep it on the spot, upright, and calm --------------------------------
@@ -485,14 +498,6 @@ def make_microduck_dance_env_cfg(
         func=microduck_mdp.bounce_reset_origin,
         mode="reset",
     )
-
-    if play:
-        # One console line per finished episode. Play only: in training the same
-        # numbers go to wandb and 4096 envs would flood the terminal.
-        cfg.events["bounce_print_diagnostics"] = EventTermCfg(
-            func=microduck_mdp.bounce_print_episode_diagnostics,
-            mode="reset",
-        )
 
     cfg.events["foot_friction"].params[
         "asset_cfg"
