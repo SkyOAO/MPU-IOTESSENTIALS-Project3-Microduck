@@ -1,164 +1,331 @@
-"""Cfg + MDP invariants for the in-place bounce (dance) task.
+"""Cfg + MDP invariants for the dance routine (walk 3 steps → stand → 3 squats, ×2).
 
-The move is small on purpose: one phase-referenced sway term, one
-phase-referenced step term, and "stay on the spot / do not tip over". These
-tests lock the phase conventions (which foot, which way the body leans) and the
-two structural decisions that are easy to undo by accident:
-
-  • the stock `upright` term MUST stay out (it penalises roll, and roll is the
-    move), and
-  • the velocity-tracking terms MUST stay out (the twist slot carries a phase
-    pair, not m/s, so they would be tracking a unit circle as a velocity).
+These tests lock the phase conventions, the reward wiring the routine depends
+on, and the one structural decision that is easy to undo by accident: the stock
+`feet_air_time` MUST stay out. Its command gate can never close on a unit-circle
+phase, so it would keep paying the policy for lifting a foot during the stand
+and squat windows.
 """
 
 import math
+import types
 
 import pytest
 import torch
 
+from mjlab.managers.scene_entity_config import SceneEntityCfg
 from mjlab_microduck.tasks import mdp as microduck_mdp
 from mjlab_microduck.tasks.microduck_dance_env_cfg import (
+    DANCE_FORWARD_M,
+    DANCE_PERIOD_S,
+    DANCE_SQUAT_DEPTH,
+    DANCE_STAND_Z,
+    DANCE_SWAY_AMPLITUDE,
+    DANCE_SWAY_DEG,
     EPISODE_LENGTH_S,
-    BOUNCE_PERIOD_S,
-    BOUNCE_SWAY_AMPLITUDE,
-    BOUNCE_SWAY_DEG,
+    N_REPS,
+    N_SQUATS,
+    N_STEPS,
+    SQUAT_START,
+    WALK_END,
     MicroduckDanceRlCfg,
     make_microduck_dance_env_cfg,
 )
+
+FEET_CFG = SceneEntityCfg("robot", site_ids=[0, 1])
 
 
 # --------------------------------------------------------------------------- #
 # Phase conventions                                                            #
 # --------------------------------------------------------------------------- #
-def test_phase_is_recovered_from_the_runtime_command_slot():
-    phases = torch.linspace(0.0, 1.0, 101)[:-1]
-    command = torch.stack(
-        [
-            torch.cos(2.0 * math.pi * phases),
-            torch.sin(2.0 * math.pi * phases),
-            torch.zeros_like(phases),
-        ],
+def _cmd(phases):
+    phases = torch.as_tensor(phases, dtype=torch.float32)
+    return torch.stack(
+        [torch.cos(2 * math.pi * phases), torch.sin(2 * math.pi * phases), torch.zeros_like(phases)],
         dim=1,
     )
-    assert torch.allclose(microduck_mdp.bounce_phase(command), phases, atol=1e-6)
 
 
-def test_sway_is_left_first_then_right():
-    # +roll = leaning LEFT. The reference peaks in the MIDDLE of each stance
-    # half (φ=0.25 while the right foot is up) and is 0 at both hand-overs.
-    phase = torch.tensor([0.0, 0.25, 0.5, 0.75])
-    reference = microduck_mdp.bounce_roll_reference(phase, BOUNCE_SWAY_AMPLITUDE)
-    assert reference.tolist() == pytest.approx(
-        [0.0, BOUNCE_SWAY_AMPLITUDE, 0.0, -BOUNCE_SWAY_AMPLITUDE], abs=1e-6
-    )
+def _local(t):
+    """Command slot for a repetition-local phase ℓ (inverse of dance_local_phase)."""
+    return _cmd([t / N_REPS])
 
 
-def test_lift_schedule_alternates_by_half_cycle():
-    # First half: RIGHT is the foot that should be off the ground; second half:
-    # LEFT. Nothing is said about the other foot — this task is a bounce, and
-    # both feet airborne together is intended.
-    phase = torch.tensor([0.0, 0.25, 0.5, 0.75])
-    schedule = microduck_mdp.bounce_lift_schedule(phase)
+def test_phase_is_recovered_from_the_runtime_command_slot():
+    phases = torch.linspace(0.0, 1.0, 101)[:-1]
+    assert torch.allclose(microduck_mdp.dance_phase(_cmd(phases)), phases, atol=1e-6)
+
+
+def test_local_phase_wraps_once_per_repetition():
+    phases = torch.tensor([0.0, 0.25, 0.5, 0.75, 0.999])
+    local = microduck_mdp.dance_local_phase(_cmd(phases), N_REPS)
+    assert torch.allclose(local, (phases * N_REPS) % 1.0, atol=1e-6)
+
+
+def test_repetition_split_is_walk_then_stand_then_squat():
+    assert 0.0 < WALK_END < SQUAT_START < 1.0
+    rep = DANCE_PERIOD_S / N_REPS
+    assert WALK_END * rep == pytest.approx(1.5, abs=1e-9)          # 3 steps @ 0.5 s
+    assert (SQUAT_START - WALK_END) * rep == pytest.approx(0.5, abs=1e-9)
+    assert (1.0 - SQUAT_START) * rep == pytest.approx(1.5, abs=1e-9)  # 3 squats @ 0.5 s
+
+
+def test_sway_is_exaggerated_but_physical():
+    # ~8° of lean is the minimum that unloads the other foot (the stance foot's
+    # inner edge is 21 mm off the centreline with the CoM 148 mm up); the walk is
+    # asked for more than that, but not for a fall.
+    assert 12.0 <= DANCE_SWAY_DEG <= 20.0
+    assert DANCE_SWAY_AMPLITUDE == pytest.approx(math.radians(DANCE_SWAY_DEG))
+
+
+# --------------------------------------------------------------------------- #
+# Phase references                                                             #
+# --------------------------------------------------------------------------- #
+def test_sway_reference_is_level_outside_the_walk():
+    for local in (0.0, WALK_END, 0.5, 0.9, 1.0 - 1e-6):
+        ref = microduck_mdp.dance_sway_reference(
+            torch.tensor([local]), WALK_END, N_STEPS, DANCE_SWAY_AMPLITUDE
+        )
+        if local >= WALK_END:
+            assert ref.item() == 0.0
+    # The sway is also zero at both ends of the walk window, so the hand-over to
+    # the stand is level.
+    for local in (0.0, WALK_END):
+        ref = microduck_mdp.dance_sway_reference(
+            torch.tensor([local]), WALK_END, N_STEPS, DANCE_SWAY_AMPLITUDE
+        )
+        assert ref.item() == pytest.approx(0.0, abs=1e-6)
+
+
+def test_sway_reference_alternates_left_and_right_each_step():
+    # Peaks sit mid-lift: window fraction (k + 0.5) / (2 · N_STEPS).
+    left = torch.tensor([WALK_END * 0.5 / (2 * N_STEPS)])
+    right = torch.tensor([WALK_END * 1.5 / (2 * N_STEPS)])
+    assert microduck_mdp.dance_sway_reference(
+        left, WALK_END, N_STEPS, DANCE_SWAY_AMPLITUDE
+    ).item() == pytest.approx(DANCE_SWAY_AMPLITUDE, abs=1e-6)
+    assert microduck_mdp.dance_sway_reference(
+        right, WALK_END, N_STEPS, DANCE_SWAY_AMPLITUDE
+    ).item() == pytest.approx(-DANCE_SWAY_AMPLITUDE, abs=1e-6)
+
+
+def test_step_schedule_alternates_and_stops_after_the_walk():
+    local = torch.tensor([0.0, WALK_END / 12, WALK_END * 0.25, WALK_END, 0.9])
+    schedule = microduck_mdp.dance_step_schedule(local, WALK_END, N_STEPS)
     # columns are (LEFT should be up, RIGHT should be up)
-    assert schedule.tolist() == [[0.0, 1.0], [0.0, 1.0], [1.0, 0.0], [1.0, 0.0]]
+    assert schedule[0].tolist() == [0.0, 1.0]
+    assert schedule[1].tolist() == [0.0, 1.0]
+    assert schedule[2].tolist() == [1.0, 0.0]
+    # Standing and squatting keep both feet planted.
+    assert schedule[3].tolist() == [0.0, 0.0]
+    assert schedule[4].tolist() == [0.0, 0.0]
 
 
-def test_centre_gate_measures_net_drift_not_the_sway():
-    # 1 where the sway crosses zero (robot should be centred), 0 at the sway
-    # peaks (the trunk is legitimately 3-5 cm to the side).
-    phase = torch.tensor([0.0, 0.25, 0.5, 0.75])
-    assert microduck_mdp.bounce_centre_gate(phase).tolist() == pytest.approx(
-        [1.0, 0.0, 1.0, 0.0], abs=1e-6
+def test_squat_reference_is_level_outside_the_squat_window():
+    level = torch.tensor([0.0, WALK_END, SQUAT_START - 1e-6])
+    ref = microduck_mdp.dance_squat_height_reference(
+        level, SQUAT_START, N_SQUATS, DANCE_STAND_Z, DANCE_SQUAT_DEPTH
+    )
+    assert torch.allclose(ref, torch.full_like(ref, DANCE_STAND_Z), atol=1e-5)
+
+
+def test_squat_reference_makes_exactly_N_SQUATS_dips_of_the_requested_depth():
+    span = 1.0 - SQUAT_START
+    bottoms = SQUAT_START + span * (torch.arange(N_SQUATS) + 0.5) / N_SQUATS
+    ref = microduck_mdp.dance_squat_height_reference(
+        bottoms, SQUAT_START, N_SQUATS, DANCE_STAND_Z, DANCE_SQUAT_DEPTH
+    )
+    assert torch.allclose(
+        ref, torch.full_like(ref, DANCE_STAND_Z - DANCE_SQUAT_DEPTH), atol=1e-6
+    )
+    # ... and comes back level at the end of the repetition.
+    end = microduck_mdp.dance_squat_height_reference(
+        torch.tensor([1.0]), SQUAT_START, N_SQUATS, DANCE_STAND_Z, DANCE_SQUAT_DEPTH
+    )
+    assert end.item() == pytest.approx(DANCE_STAND_Z, abs=1e-6)
+
+
+# --------------------------------------------------------------------------- #
+# Task terms                                                                   #
+# --------------------------------------------------------------------------- #
+class _Scene(dict):
+    """dict for `scene[name]` lookups plus the terrain the height terms read."""
+
+    def __init__(self, **items):
+        super().__init__(**items)
+        self.terrain = types.SimpleNamespace(env_origins=torch.zeros(1, 3))
+
+
+def _dance_env(local, gravity=None, pos=None, sites=None, air_time=None):
+    """Minimal stand-in for a ManagerBasedRlEnv carrying one environment."""
+    command = _local(local)
+    data = types.SimpleNamespace(
+        projected_gravity_b=gravity if gravity is not None else torch.zeros(1, 3),
+        root_link_pos_w=pos if pos is not None else torch.zeros(1, 3),
+        root_link_quat_w=torch.tensor([[1.0, 0.0, 0.0, 0.0]]),
+        site_pos_w=sites if sites is not None else torch.zeros(1, 2, 3),
+    )
+    scene = _Scene(robot=types.SimpleNamespace(data=data))
+    if air_time is not None:
+        scene["feet_ground_contact"] = types.SimpleNamespace(
+            data=types.SimpleNamespace(current_air_time=air_time)
+        )
+    return types.SimpleNamespace(
+        num_envs=1,
+        device=torch.device("cpu"),
+        step_dt=0.02,
+        commands={"twist": command},
+        command_manager=types.SimpleNamespace(get_command=lambda _n: command),
+        scene=scene,
     )
 
 
-def test_drift_containment_prices_forward_harder_than_lateral():
-    """Forward creep is the reported failure mode; the sway is lateral. The same
-    10 cm must cost far more in x than in y, so the move is not taxed."""
-    import types
-
-    cfg = make_microduck_dance_env_cfg()
-    term = cfg.rewards["bounce_stay_in_place"]
-    command = torch.tensor([[1.0, 0.0, 0.0]])  # φ = 0 → centre gate = 1
-
-    class _Cmd:
-        def get_command(self, _name):
-            return command
-
-    def score_at(dx: float, dy: float) -> float:
-        env = types.SimpleNamespace(
-            command_manager=_Cmd(),
-            scene={
-                "robot": types.SimpleNamespace(
-                    data=types.SimpleNamespace(
-                        root_link_pos_w=torch.tensor([[dx, dy, 0.15]])
-                    )
-                )
-            },
-        )
-        env._bounce_origin_pos = torch.tensor([[0.0, 0.0, 0.15]])
-        return term.func(env, **term.params).item()
-
-    assert score_at(0.0, 0.0) == pytest.approx(1.0)
-    assert score_at(0.10, 0.0) < 0.10          # forward is nearly zeroed
-    assert score_at(0.0, 0.10) > 0.5           # sideways stays cheap
-    assert score_at(0.10, 0.0) < score_at(0.0, 0.10)
+def test_sway_tracking_is_maximal_when_the_lean_matches_the_reference():
+    gravity = torch.tensor(
+        [[0.0, -math.sin(DANCE_SWAY_AMPLITUDE), -math.cos(DANCE_SWAY_AMPLITUDE)]]
+    )
+    env = _dance_env(WALK_END * 0.5 / (2 * N_STEPS), gravity=gravity)
+    score = microduck_mdp.dance_sway_tracking(
+        env,
+        command_name="twist",
+        n_reps=N_REPS,
+        walk_end=WALK_END,
+        n_steps=N_STEPS,
+        amplitude=DANCE_SWAY_AMPLITUDE,
+        std=0.10,
+    )
+    assert score.item() == pytest.approx(1.0, abs=1e-6)
 
 
-def test_lift_window_is_open_only_at_each_foot_s_sway_peak():
-    phase = torch.tensor([0.0, 0.25, 0.5, 0.75])
-    window = microduck_mdp.bounce_lift_window(phase, half_width=0.15)
-    # columns are (LEFT, RIGHT): hand-overs are closed, peaks open one side.
-    assert window.tolist() == [[0.0, 0.0], [0.0, 1.0], [0.0, 0.0], [1.0, 0.0]]
+def test_step_tracking_needs_both_the_schedule_and_the_lift():
+    env = _dance_env(0.0, air_time=torch.tensor([[0.0, 0.2]]))  # RIGHT airborne
+    score = microduck_mdp.dance_step_tracking(
+        env,
+        command_name="twist",
+        sensor_name="feet_ground_contact",
+        n_reps=N_REPS,
+        walk_end=WALK_END,
+        n_steps=N_STEPS,
+    )
+    assert score.item() == pytest.approx(1.0)
 
 
-def test_lift_term_requires_flight_inside_the_window():
-    """The bounce must stay a bounce (both feet may leave together) but ONLY at
-    the sway peak: the per-step lift reward used to be farmable by keeping the
-    feet airborne the whole episode (`foot air L 1.00 R 1.00`)."""
-    import types
-
-    def score(phase: float, air_left: float, air_right: float) -> float:
-        # φ = 0 → cos = 1, sin = 0; φ = 0.25 → cos = 0, sin = 1.
-        command = torch.tensor(
-            [[math.cos(2 * math.pi * phase), math.sin(2 * math.pi * phase), 0.0]]
-        )
-
-        class _Cmd:
-            def get_command(self, _name):
-                return command
-
-        class _Sensor:
-            class data:
-                current_air_time = torch.tensor([[air_left, air_right]])
-
-        env = types.SimpleNamespace(
-            command_manager=_Cmd(), scene={"feet_ground_contact": _Sensor()}
-        )
-        return microduck_mdp.bounce_lift_tracking(
-            env,
-            command_name="twist",
-            sensor_name="feet_ground_contact",
-            half_width=0.15,
-            off_window_penalty=0.5,
-        ).item()
-
-    # At the RIGHT foot's peak (φ=0.25) both feet may be up → full credit.
-    assert score(0.25, 0.20, 0.20) == pytest.approx(1.0)
-    assert score(0.25, 0.00, 0.20) == pytest.approx(1.0)  # other foot planted
-    assert score(0.25, 0.20, 0.00) == pytest.approx(0.0)  # scheduled foot down
-    # At the hand-over (φ=0) BOTH feet must be planted; flight is charged.
-    assert score(0.0, 0.20, 0.20) == pytest.approx(-0.5)
-    assert score(0.0, 0.00, 0.00) == pytest.approx(0.0)
+def test_step_tracking_pays_nothing_during_the_stand_window():
+    env = _dance_env(SQUAT_START * 0.9, air_time=torch.tensor([[0.2, 0.2]]))
+    score = microduck_mdp.dance_step_tracking(
+        env,
+        command_name="twist",
+        sensor_name="feet_ground_contact",
+        n_reps=N_REPS,
+        walk_end=WALK_END,
+        n_steps=N_STEPS,
+    )
+    assert score.item() == 0.0
 
 
-def test_sway_amplitude_is_large_enough_to_unload_a_foot():
-    # Geometry (robot_walk.xml, HOME): the stance foot's inner edge is 21.2 mm
-    # from the centreline and the CoM sits 148 mm up, so ~8° of lean is the
-    # minimum that can lift the other foot and ~15° centres the CoM over the
-    # stance foot. "Big amplitude" has to mean bigger than the minimum.
-    assert 8.0 <= BOUNCE_SWAY_DEG <= 20.0
-    assert BOUNCE_SWAY_AMPLITUDE == pytest.approx(math.radians(BOUNCE_SWAY_DEG))
+def _progress_env(local):
+    env = _dance_env(local)
+    env._dance_origin_pos = torch.zeros(1, 3)
+    env._dance_origin_yaw = torch.zeros(1)
+    env._dance_fwd_max = torch.zeros(1)
+    env._dance_fwd_paid = torch.zeros(1)
+    return env
+
+
+def test_forward_progress_pays_only_for_new_ground():
+    env = _progress_env(0.0)
+    asset = env.scene["robot"]
+
+    stand = microduck_mdp.dance_forward_progress(
+        env, command_name="twist", n_reps=N_REPS, walk_end=WALK_END,
+        target_distance=DANCE_FORWARD_M,
+    )
+    assert stand.item() == 0.0  # marching in place pays nothing
+
+    asset.data.root_link_pos_w[0, 0] = 0.01
+    stepped = microduck_mdp.dance_forward_progress(
+        env, command_name="twist", n_reps=N_REPS, walk_end=WALK_END,
+        target_distance=DANCE_FORWARD_M,
+    )
+    assert stepped.item() > 0.0
+
+    # Walking back does not pay again, and the frontier is not un-earned.
+    asset.data.root_link_pos_w[0, 0] = 0.0
+    back = microduck_mdp.dance_forward_progress(
+        env, command_name="twist", n_reps=N_REPS, walk_end=WALK_END,
+        target_distance=DANCE_FORWARD_M,
+    )
+    assert back.item() == 0.0
+
+
+def test_forward_progress_is_inactive_during_the_stand_window():
+    env = _progress_env(SQUAT_START * 0.9)
+    env.scene["robot"].data.root_link_pos_w[0, 0] = 0.05
+    reward = microduck_mdp.dance_forward_progress(
+        env, command_name="twist", n_reps=N_REPS, walk_end=WALK_END,
+        target_distance=DANCE_FORWARD_M,
+    )
+    assert reward.item() == 0.0
+
+
+def test_squat_tracking_is_inactive_during_the_walk():
+    env = _dance_env(0.0, pos=torch.tensor([[0.0, 0.0, DANCE_STAND_Z - 0.05]]))
+    score = microduck_mdp.dance_squat_tracking(
+        env,
+        command_name="twist",
+        n_reps=N_REPS,
+        walk_end=WALK_END,
+        squat_start=SQUAT_START,
+        n_squats=N_SQUATS,
+        stand_z=DANCE_STAND_Z,
+        depth=DANCE_SQUAT_DEPTH,
+        std=0.015,
+    )
+    assert score.item() == 0.0
+
+
+def test_squat_tracking_is_maximal_at_the_dip_bottom():
+    span = 1.0 - SQUAT_START
+    local = SQUAT_START + span * 0.5 / N_SQUATS
+    env = _dance_env(local, pos=torch.tensor([[0.0, 0.0, DANCE_STAND_Z - DANCE_SQUAT_DEPTH]]))
+    score = microduck_mdp.dance_squat_tracking(
+        env,
+        command_name="twist",
+        n_reps=N_REPS,
+        walk_end=WALK_END,
+        squat_start=SQUAT_START,
+        n_squats=N_SQUATS,
+        stand_z=DANCE_STAND_Z,
+        depth=DANCE_SQUAT_DEPTH,
+        std=0.015,
+    )
+    assert score.item() == pytest.approx(1.0, abs=1e-6)
+
+
+def test_feet_level_penalty_grows_with_the_fore_aft_stagger():
+    sites = torch.zeros(1, 2, 3)
+    sites[0, 0, 0] = 0.02  # left foot 2 cm ahead of the right one
+    env = _dance_env(SQUAT_START * 0.9, sites=sites)
+    score = microduck_mdp.dance_feet_level_l1(
+        env, command_name="twist", n_reps=N_REPS, walk_end=WALK_END, feet_cfg=FEET_CFG
+    )
+    assert score.item() == pytest.approx(-0.02, abs=1e-6)
+
+    sites[0, 0, 0] = 0.0
+    score = microduck_mdp.dance_feet_level_l1(
+        env, command_name="twist", n_reps=N_REPS, walk_end=WALK_END, feet_cfg=FEET_CFG
+    )
+    assert score.item() == pytest.approx(0.0, abs=1e-6)
+
+
+def test_feet_are_not_judged_while_walking():
+    sites = torch.zeros(1, 2, 3)
+    sites[0, 0, 0] = 0.05  # a long stride, which is not a stagger
+    env = _dance_env(0.0, sites=sites)
+    score = microduck_mdp.dance_feet_level_l1(
+        env, command_name="twist", n_reps=N_REPS, walk_end=WALK_END, feet_cfg=FEET_CFG
+    )
+    assert score.item() == 0.0
 
 
 # --------------------------------------------------------------------------- #
@@ -169,76 +336,66 @@ def test_cfg_reuses_the_shared_phase_command():
     command = cfg.commands["twist"]
     # No new command class: GroundPickPhaseCommand already emits [cos, sin, 0].
     assert isinstance(command, microduck_mdp.GroundPickPhaseCommandCfg)
-    assert command.period == BOUNCE_PERIOD_S
-    # Every episode starts at φ=0 (standing hand-over), like the button press.
+    assert command.period == DANCE_PERIOD_S
+    # Every episode starts at φ=0, like the runtime button press.
     assert command.randomize_phase is False
 
 
-def test_spin_terms_and_helpers_are_gone():
-    """The commanded yaw revolution was removed (2026-10-02): neither the turn
-    rewards/metrics nor their helpers may come back."""
+def test_the_bounce_terms_are_gone():
+    """The in-place bounce was replaced, not patched: none of its terms may
+    come back, and neither may the stock air-time term it superseded."""
     cfg = make_microduck_dance_env_cfg()
     for name in (
-        "bounce_turn_rate_tracking",
-        "bounce_turn_angle_l1",
-        "bounce_heading_hold",
-        "bounce_heading_l1",
+        "bounce_roll_tracking",
+        "bounce_roll_l1",
+        "bounce_lift_tracking",
+        "bounce_stay_in_place",
+        "bounce_stay_in_place_l1",
+        "bounce_pitch_balance",
+        "bounce_head_hold",
+        "air_time",
     ):
         assert name not in cfg.rewards, name
     for name in (
-        "bounce_yaw_total_deg",
-        "bounce_yaw_path_deg",
-        "bounce_turn_error_deg",
-        "bounce_turn_rate_ref_deg_s",
-    ):
-        assert name not in cfg.metrics, name
-    for name in (
-        "bounce_turn_rate_tracking",
-        "bounce_turn_angle_l1",
-        "bounce_turn_target_deg",
-        "bounce_turn_rate_ref_deg_s",
-        "bounce_metric_yaw_total_deg",
-        "bounce_metric_yaw_path_deg",
-        "bounce_metric_turn_error_deg",
-        "bounce_metric_turn_rate_ref_deg_s",
-        "bounce_episode_time",
+        "bounce_phase",
+        "bounce_roll_reference",
+        "bounce_roll_tracking",
+        "bounce_lift_tracking",
+        "bounce_lift_schedule",
+        "bounce_stay_in_place",
+        "bounce_pitch_balance",
+        "bounce_head_hold",
+        "bounce_reset_origin",
+        "bounce_metric_sway_amp_deg",
+        "bounce_metric_drift_m",
     ):
         assert not hasattr(microduck_mdp, name), name
 
 
-def test_the_move_is_two_task_terms():
+def test_the_routine_terms_are_registered():
     cfg = make_microduck_dance_env_cfg()
-    assert cfg.rewards["bounce_roll_tracking"].weight == pytest.approx(5.0)
-    assert cfg.rewards["bounce_roll_tracking"].params["amplitude"] == pytest.approx(
-        BOUNCE_SWAY_AMPLITUDE
-    )
-    assert cfg.rewards["bounce_lift_tracking"].weight == pytest.approx(3.0)
-    # The move (sway + lift, with the stock gait shaping that feeds the bounce)
-    # must out-bid everything that only says "do not misbehave".
-    smallest_task = min(
-        cfg.rewards[n].weight
-        for n in ("bounce_roll_tracking", "bounce_lift_tracking", "air_time")
-    )
-    largest_containment = max(
-        cfg.rewards[n].weight
-        for n in (
-            "bounce_pitch_balance",
-            "bounce_stay_in_place",
-            "bounce_stay_in_place_l1",
-            "bounce_yaw_rate_l1",
-            "bounce_roll_l1",
-            "pose",
-            "bounce_head_hold",
-        )
-    )
-    assert smallest_task >= largest_containment
+    expected = {
+        "dance_sway_tracking": 5.0,
+        "dance_sway_l1": 0.6,
+        "dance_step_tracking": 3.0,
+        "dance_forward_progress": 4.0,
+        "dance_heading_l1": 1.0,
+        "dance_squat_tracking": 4.0,
+        "dance_squat_l1": 0.5,
+        "dance_feet_level_l1": 1.0,
+        "dance_pitch_balance": 2.0,
+        "dance_head_hold": 0.4,
+    }
+    for name, weight in expected.items():
+        assert name in cfg.rewards, name
+        assert cfg.rewards[name].weight == pytest.approx(weight), name
 
 
 def test_upright_is_replaced_by_a_pitch_only_balance_term():
-    # `upright` penalises roll, which is the move; it must not come back.
+    # `upright` penalises roll, which the sway is; it must not come back.
     cfg = make_microduck_dance_env_cfg()
     assert "upright" not in cfg.rewards
-    assert cfg.rewards["bounce_pitch_balance"].weight > 0.0
+    assert cfg.rewards["dance_pitch_balance"].weight > 0.0
 
 
 def test_velocity_tracking_terms_are_removed():
@@ -249,40 +406,36 @@ def test_velocity_tracking_terms_are_removed():
     assert "track_angular_velocity" not in cfg.rewards
 
 
-def test_self_negating_l1_term_keeps_a_positive_weight():
-    # `bounce_roll_l1` returns ≤ 0 → POSITIVE weight (a negative weight would
-    # double-negate into paying for the violation).
+def test_self_negating_l1_terms_keep_a_positive_weight():
     cfg = make_microduck_dance_env_cfg()
-    for name in ("bounce_roll_l1", "bounce_stay_in_place_l1", "bounce_yaw_rate_l1"):
+    for name in (
+        "dance_sway_l1",
+        "dance_squat_l1",
+        "dance_heading_l1",
+        "dance_feet_level_l1",
+    ):
         assert cfg.rewards[name].weight > 0.0, name
 
 
-def test_containment_terms_do_not_dominate_the_reward_mass():
-    """2026-10-01 lesson: at heading_l1 = 1.5 + stay_l1 = 3.0 the containment
-    terms cost ~30 % of the positive reward and achieved NEITHER goal (the robot
-    still turned 84° and travelled 1.1 m). What is left is a gentle bias on the
-    travel only."""
+def test_the_unused_command_slots_are_zero_padded():
+    """This skill drives only the twist slot: the head/body command slots stay
+    in the 61D layout but carry zeros (the velocity template's head/body
+    commands are not part of this env, so there is nothing to sample)."""
     cfg = make_microduck_dance_env_cfg()
-    containment = (
-        cfg.rewards["bounce_stay_in_place"].weight
-        + cfg.rewards["bounce_stay_in_place_l1"].weight
-    )
-    assert containment <= cfg.rewards["bounce_roll_tracking"].weight
-    assert cfg.rewards["bounce_stay_in_place_l1"].weight <= 1.0
+    assert set(cfg.commands) == {"twist"}
+    for group in ("actor", "critic"):
+        assert cfg.observations[group].terms["head_command"].func is microduck_mdp.zero_command_padding
+        assert cfg.observations[group].terms["body_command"].func is microduck_mdp.zero_command_padding
 
 
 def test_diagnostics_are_registered_as_episode_metrics():
     cfg = make_microduck_dance_env_cfg()
     expected = {
-        # mean of 2·roll·sin(2πφ) = sway amplitude in phase with the reference
-        "bounce_sway_amp_deg": "mean",
-        "bounce_roll_error_deg": "mean",
-        "bounce_left_air_frac": "mean",
-        "bounce_right_air_frac": "mean",
-        "bounce_drift_m": "last",
-        "bounce_pitch_deg": "mean",
-        # Yaw-rate diagnostic (episode mean of the signed rate).
-        "bounce_yaw_rate_deg_s": "mean",
+        "dance_sway_amp_deg": "mean",
+        "dance_height_err_mm": "mean",
+        "dance_forward_m": "last",
+        "dance_yaw_drift_deg": "last",
+        "dance_feet_fore_aft_mm": "last",
     }
     for name, reduce in expected.items():
         assert name in cfg.metrics, name
@@ -308,90 +461,47 @@ def test_every_registered_term_takes_env_as_its_first_parameter():
             assert first == "env", f"{kind} '{name}' must take env first, got {first!r}"
 
 
-def test_l1_penalties_stay_O_of_one():
-    """L1 shaping terms must stay O(1): a term that scales with absolute units
-    (degrees, metres × large factors) and grows over the episode pays the robot
-    to terminate early. Worst-case weighted magnitudes here must stay O(1)."""
-    import types
+def test_every_registered_term_accepts_its_configured_params():
+    """A param the function does not take is a TypeError on the first step —
+    catch it here instead of in a 5-iteration smoke test."""
+    import inspect
 
     cfg = make_microduck_dance_env_cfg()
-    term = cfg.rewards["bounce_roll_l1"]
-    # Worst case: the trunk is leaning fully the opposite way to the reference.
-    command = torch.tensor([[1.0, 0.0, 0.0]])  # φ = 0, reference roll = 0
-    gravity = torch.zeros(1, 3)
-    gravity[0, 1] = math.sin(BOUNCE_SWAY_AMPLITUDE)  # lean right → −roll
-    gravity[0, 2] = -math.cos(BOUNCE_SWAY_AMPLITUDE)
+    for kind, terms in (("reward", cfg.rewards), ("metric", cfg.metrics)):
+        for name, term in terms.items():
+            if not inspect.isfunction(term.func):
+                continue
+            inspect.signature(term.func).bind(None, **term.params)  # env positional
 
-    class _Cmd:
-        def get_command(self, _name):
-            return command
 
-    env = types.SimpleNamespace(
-        num_envs=1,
-        device=torch.device("cpu"),
-        command_manager=_Cmd(),
-        scene={
-            "robot": types.SimpleNamespace(
-                data=types.SimpleNamespace(projected_gravity_b=gravity)
-            )
-        },
+def test_sway_l1_stays_O_of_one():
+    """L1 shaping terms must stay O(1): a term that grows with absolute units
+    pays the robot to terminate early. Worst case here is a full opposite lean."""
+    gravity = torch.tensor(
+        [[0.0, math.sin(DANCE_SWAY_AMPLITUDE), -math.cos(DANCE_SWAY_AMPLITUDE)]]
     )
-    worst = term.func(env, **term.params) * term.weight
-    assert worst.item() > -3.0, f"roll L1 worst case {worst.item():.1f} is not O(1)"
+    env = _dance_env(0.0, gravity=gravity)
+    worst = microduck_mdp.dance_sway_l1(
+        env,
+        command_name="twist",
+        n_reps=N_REPS,
+        walk_end=WALK_END,
+        n_steps=N_STEPS,
+        amplitude=DANCE_SWAY_AMPLITUDE,
+    )
+    assert worst.item() > -1.0
 
 
-def test_yaw_rate_term_is_a_nonpositive_penalty():
-    """`bounce_yaw_rate_l1` must be ≤ 0 (self-negating → POSITIVE weight) and
-    must charge spin in either direction."""
-    import types
-
+def test_episode_is_exactly_one_routine():
     cfg = make_microduck_dance_env_cfg()
-    term = cfg.rewards["bounce_yaw_rate_l1"]
-
-    def value_for(rate: float) -> float:
-        env = types.SimpleNamespace(
-            scene={
-                "robot": types.SimpleNamespace(
-                    data=types.SimpleNamespace(
-                        root_link_ang_vel_b=torch.tensor([[0.0, 0.0, rate]])
-                    )
-                )
-            }
-        )
-        return term.func(env, **term.params).item()
-
-    assert value_for(0.0) == pytest.approx(0.0)
-    assert value_for(0.9) == pytest.approx(-0.9)
-    assert value_for(-0.9) == pytest.approx(-0.9)
-
-
-def test_play_mode_does_not_print_per_episode_diagnostics():
-    train_cfg = make_microduck_dance_env_cfg(play=False)
-    play_cfg = make_microduck_dance_env_cfg(play=True)
-    assert "bounce_print_diagnostics" not in train_cfg.events
-    assert "bounce_print_diagnostics" not in play_cfg.events
-    assert not hasattr(microduck_mdp, "bounce_print_episode_diagnostics")
-    assert "bounce_reset_origin" in train_cfg.events
-
-
-def test_episode_holds_a_whole_number_of_short_bounce_cycles():
-    cfg = make_microduck_dance_env_cfg()
-    # 3 s = 3 bounces of 1 s each; the move is periodic so that is all it needs.
-    assert BOUNCE_PERIOD_S == pytest.approx(1.0)
-    assert EPISODE_LENGTH_S == pytest.approx(3.0)
-    assert EPISODE_LENGTH_S / BOUNCE_PERIOD_S == pytest.approx(3.0)
+    assert EPISODE_LENGTH_S == pytest.approx(DANCE_PERIOD_S)
     assert cfg.episode_length_s == pytest.approx(EPISODE_LENGTH_S)
-    assert EPISODE_LENGTH_S / BOUNCE_PERIOD_S == pytest.approx(
-        round(EPISODE_LENGTH_S / BOUNCE_PERIOD_S)
-    )
 
 
 def test_actor_observation_block_is_still_the_shared_61d_layout():
     cfg = make_microduck_dance_env_cfg()
     terms = cfg.observations["actor"].terms
-    command_terms = [
-        n for n in terms if n in ("command", "head_command", "body_command")
-    ]
+    command_terms = [n for n in terms if n in ("command", "head_command", "body_command")]
     assert command_terms == ["command", "head_command", "body_command"]
     assert terms["command"].params["command_name"] == "twist"
     assert terms["head_command"].params["dim"] == 4

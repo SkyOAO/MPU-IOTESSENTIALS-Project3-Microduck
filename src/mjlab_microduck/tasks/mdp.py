@@ -5030,183 +5030,237 @@ class GroundPickPhaseCommandCfg(UniformVelocityCommandCfg):
 
 
 # --------------------------------------------------------------------------- #
-# Dance — exaggerated bounce in place                                           #
+# Dance — walk forward, stand, quick shallow squats (routine ×2)                #
 # --------------------------------------------------------------------------- #
 #
-# One cycle (φ ∈ [0,1), period = cfg's BOUNCE_PERIOD_S):
-#   φ ∈ [0.00, 0.50)  trunk leans LEFT, the RIGHT foot is the one that lifts
-#   φ ∈ [0.50, 1.00)  trunk leans RIGHT, the LEFT foot is the one that lifts
+# One period (φ ∈ [0,1), period = cfg's DANCE_PERIOD_S) holds N_REPS identical
+# repetitions. Inside one repetition (local phase ℓ ∈ [0,1)):
 #
-# A bounce, not a walk or a march: the feet leave the ground (both airborne
-# together is expected) and the robot must stay on the spot. Signs (x forward,
-# y left, z up): +roll = lean left; the roll reference is A·sin(2πφ), so it
-# peaks mid-stance-half and is 0 at the weight hand-overs. The phase travels in
-# the twist slot as [cos(2πφ), sin(2πφ), 0] — the runtime one-shot contract —
-# so `GroundPickPhaseCommand` is reused unchanged.
+#   ℓ ∈ [0, WALK_END)            walk forward N_STEPS steps; the trunk sways with
+#                                each step (the exaggerated bounce look)
+#   ℓ ∈ [WALK_END, SQUAT_START)  stand still
+#   ℓ ∈ [SQUAT_START, 1.0)       N_SQUATS quick shallow squats
 #
-# The move is TWO phase-referenced terms (roll, foot lift); everything else is a
-# stock regulariser or containment.
+# The phase travels in the twist slot as [cos(2πφ), sin(2πφ), 0] — the runtime
+# one-shot contract — so `GroundPickPhaseCommand` is reused unchanged. Signs
+# (x forward, y left, z up): +roll = lean left, and the sway reference is
+# A·sin(2π·N_STEPS·ℓ/WALK_END), peaking mid-stance, so the RIGHT foot lifts
+# while the trunk leans LEFT (the bounce convention, kept).
+#
+# Every task term is a function of the phase, so no stock gait term gates on the
+# twist slot any more: the slot carries a unit-circle phase, so the stock
+# `command_threshold` gate can never close. `feet_air_time` would go on paying
+# for lifting a foot during the stand and squat windows; `dance_step_tracking`
+# replaces it. The stock foot terms that are kept (clearance, swing height, slip)
+# all scale with foot velocity, so they are inert while the robot stands still.
 _DEG = 180.0 / math.pi
 
 
-def bounce_phase(command: torch.Tensor) -> torch.Tensor:
-    """Recover the bounce phase φ ∈ [0, 1) from the twist command slot."""
+def dance_phase(command: torch.Tensor) -> torch.Tensor:
+    """Global phase φ ∈ [0, 1) from the twist command slot."""
     return torch.atan2(command[:, 1], command[:, 0]) / (2.0 * math.pi) % 1.0
 
 
-def bounce_roll_reference(phase: torch.Tensor, amplitude: float) -> torch.Tensor:
-    """Target trunk roll (rad, + = lean left) at the current phase."""
-    return amplitude * torch.sin(2.0 * math.pi * phase)
+def dance_local_phase(command: torch.Tensor, n_reps: int) -> torch.Tensor:
+    """Local phase ℓ ∈ [0, 1) inside the current repetition."""
+    return (dance_phase(command) * n_reps) % 1.0
 
 
-def _bounce_trunk_roll(asset: Entity) -> torch.Tensor:
-    """Trunk roll from projected gravity (rad). Positive = leaning left."""
+def _dance_command(env: ManagerBasedRlEnv, command_name: str) -> torch.Tensor:
+    command = env.command_manager.get_command(command_name)
+    assert command is not None, f"Command '{command_name}' not found."
+    return command
+
+
+def _dance_trunk_roll(asset: Entity) -> torch.Tensor:
+    """Trunk roll (rad) from projected gravity. Positive = leaning left."""
     g = torch.nan_to_num(asset.data.projected_gravity_b, nan=0.0)
     return torch.atan2(-g[:, 1], -g[:, 2])
 
 
-def bounce_reset_origin(
+def _dance_trunk_height(env: ManagerBasedRlEnv, asset: Entity) -> torch.Tensor:
+    """Trunk height above the terrain origin (m)."""
+    return torch.nan_to_num(
+        asset.data.root_link_pos_w[:, 2] - env.scene.terrain.env_origins[:, 2], nan=0.0
+    )
+
+
+def _dance_trunk_yaw(asset: Entity) -> torch.Tensor:
+    """Trunk yaw (rad) from the world quaternion (w, x, y, z)."""
+    quat = asset.data.root_link_quat_w
+    return torch.atan2(
+        2.0 * (quat[:, 0] * quat[:, 3] + quat[:, 1] * quat[:, 2]),
+        1.0 - 2.0 * (quat[:, 2] ** 2 + quat[:, 3] ** 2),
+    )
+
+
+def _dance_feet_fore_aft(asset: Entity, feet_cfg: SceneEntityCfg) -> torch.Tensor:
+    """Signed fore/aft offset (m) between the two feet, along the trunk heading.
+
+    ``feet_cfg`` is passed in by the term rather than defaulted here: a
+    module-level default would be resolved (and mutated) in place by the term
+    manager, which the cfg files share across envs.
+    """
+    pos = asset.data.site_pos_w[:, feet_cfg.site_ids, :2]  # (N, 2, 2)
+    yaw = _dance_trunk_yaw(asset)
+    delta = pos[:, 0] - pos[:, 1]
+    return delta[:, 0] * torch.cos(yaw) + delta[:, 1] * torch.sin(yaw)
+
+
+def dance_reset_origin(
     env: ManagerBasedRlEnv,
     env_ids: torch.Tensor,
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> None:
-    """Reset event: record the world pose the bounce is judged against."""
+    """Reset event: record the trunk pose the routine is judged against.
+
+    The spawn heading is the reference for both the "went straight" penalty
+    (``dance_heading_l1``) and the forward-progress accumulator
+    (``dance_forward_progress``), which is cleared here too.
+    """
     asset: Entity = env.scene[asset_cfg.name]
     if env_ids is None:
         env_ids = torch.arange(env.num_envs, device=env.device, dtype=torch.long)
     else:
         env_ids = env_ids.to(env.device, dtype=torch.long)
 
-    if not hasattr(env, "_bounce_origin_pos"):
+    if not hasattr(env, "_dance_origin_pos"):
         dtype = asset.data.root_link_pos_w.dtype
-        env._bounce_origin_pos = torch.zeros(env.num_envs, 3, device=env.device, dtype=dtype)
+        env._dance_origin_pos = torch.zeros(env.num_envs, 3, device=env.device, dtype=dtype)
+        env._dance_origin_yaw = torch.zeros(env.num_envs, device=env.device, dtype=dtype)
+        env._dance_fwd_max = torch.zeros(env.num_envs, device=env.device, dtype=dtype)
+        env._dance_fwd_paid = torch.zeros(env.num_envs, device=env.device, dtype=dtype)
 
-    env._bounce_origin_pos[env_ids] = asset.data.root_link_pos_w[env_ids]
+    env._dance_origin_pos[env_ids] = asset.data.root_link_pos_w[env_ids]
+    env._dance_origin_yaw[env_ids] = _dance_trunk_yaw(asset)[env_ids]
+    env._dance_fwd_max[env_ids] = 0.0
+    env._dance_fwd_paid[env_ids] = 0.0
 
 
-def _bounce_drift_vec(
-    env: ManagerBasedRlEnv,
-    asset: Entity,
+def _dance_forward_offset(env: ManagerBasedRlEnv, asset: Entity) -> torch.Tensor:
+    """Forward displacement (m) from the reset pose, along the spawn heading."""
+    delta = torch.nan_to_num(asset.data.root_link_pos_w - env._dance_origin_pos, nan=0.0)
+    yaw = env._dance_origin_yaw
+    return delta[:, 0] * torch.cos(yaw) + delta[:, 1] * torch.sin(yaw)
+
+
+# --------------------------------------------------------------------------- #
+# Dance — the phase references                                                  #
+# --------------------------------------------------------------------------- #
+def dance_sway_reference(
+    local: torch.Tensor,
+    walk_end: float,
+    n_steps: int,
+    amplitude: float,
 ) -> torch.Tensor:
-    """Horizontal trunk displacement (m) from the bounce start, as ``(x, y)``."""
-    return asset.data.root_link_pos_w[:, :2] - env._bounce_origin_pos[:, :2]
+    """Trunk roll target (rad): one sway per step, zero outside the walk window.
 
-
-def _bounce_drift(
-    env: ManagerBasedRlEnv,
-    asset: Entity,
-) -> torch.Tensor:
-    """Horizontal distance (m) of the trunk from its bounce-start position."""
-    delta = _bounce_drift_vec(env, asset)
-    return torch.sqrt((delta**2).sum(dim=-1))
-
-
-def bounce_centre_gate(phase: torch.Tensor) -> torch.Tensor:
-    """cos(2πφ)²: 1 where the sway crosses zero, 0 at the peaks.
-
-    Gates the drift terms so they price NET drift. The sway itself moves the
-    trunk ~31 mm sideways at 12° of lean, so judging position at every instant
-    would tax the motion the policy was asked to make.
+    Starts and ends at 0, so the walk hands over to a level stand and the second
+    repetition starts level again.
     """
-    return torch.cos(2.0 * math.pi * phase) ** 2
+    in_walk = (local < walk_end).to(torch.float32)
+    return amplitude * torch.sin(2.0 * math.pi * n_steps * local / walk_end) * in_walk
 
 
-def bounce_lift_schedule(phase: torch.Tensor) -> torch.Tensor:
+def dance_step_schedule(
+    local: torch.Tensor,
+    walk_end: float,
+    n_steps: int,
+) -> torch.Tensor:
     """Which foot should be off the ground: ``[N, 2]`` of (LEFT up, RIGHT up).
 
-    Right foot in the first half of the cycle, left in the second. Says nothing
-    about the other foot — both feet airborne together is intended here.
+    One lift per step, RIGHT foot first in each cycle — the same convention as
+    the bounce, so the trunk leans LEFT while the RIGHT foot is airborne. All
+    zeros outside the walk window: standing and squatting keep both feet planted.
     """
-    right_up = (phase < 0.5).to(torch.float32)
-    left_up = 1.0 - right_up
-    return torch.stack((left_up, right_up), dim=-1)
+    in_walk = local < walk_end
+    right_up = ((local / walk_end * n_steps) % 1.0 < 0.5) & in_walk
+    left_up = (~right_up) & in_walk
+    return torch.stack((left_up.to(torch.float32), right_up.to(torch.float32)), dim=-1)
 
 
-def _bounce_phase_in_window(
-    phase: torch.Tensor, centre: float, half_width: float
+def dance_squat_height_reference(
+    local: torch.Tensor,
+    squat_start: float,
+    n_squats: int,
+    stand_z: float,
+    depth: float,
 ) -> torch.Tensor:
-    """1 where φ lies within ``±half_width`` of ``centre`` on the circular phase."""
-    delta = (phase - centre + 0.5) % 1.0 - 0.5
-    return (delta.abs() <= half_width).to(phase.dtype)
+    """Trunk height target (m): ``stand_z``, then N_SQUATS dips after squat_start.
 
-
-def bounce_lift_window(phase: torch.Tensor, half_width: float) -> torch.Tensor:
-    """``[N, 2]`` of (LEFT, RIGHT): is that foot's flight window open?
-
-    A foot may only be off the ground near its own sway peak — RIGHT around
-    φ=0.25 (the body leans left, unloading the right foot), LEFT around φ=0.75.
-    Between windows the robot MUST be planted; that is what bounds the move to
-    one lift per half-cycle instead of a free-running flutter.
+    The dip profile is 0.5 − 0.5·cos(2π·N_SQUATS·t), which starts and ends at
+    ``stand_z``, so the squat window joins the stand window without a step in
+    the target (and the second repetition starts level).
     """
-    right_open = _bounce_phase_in_window(phase, 0.25, half_width)
-    left_open = _bounce_phase_in_window(phase, 0.75, half_width)
-    return torch.stack((left_open, right_open), dim=-1)
+    t = (local - squat_start) / (1.0 - squat_start)
+    dip = 0.5 - 0.5 * torch.cos(2.0 * math.pi * n_squats * t)
+    return torch.where(
+        local >= squat_start, stand_z - depth * dip, torch.full_like(local, stand_z)
+    )
 
 
 # --------------------------------------------------------------------------- #
-# Bounce — the two task terms                                                   #
+# Dance — the walk                                                              #
 # --------------------------------------------------------------------------- #
-def bounce_roll_tracking(
+def dance_sway_tracking(
     env: ManagerBasedRlEnv,
     command_name: str,
+    n_reps: int,
+    walk_end: float,
+    n_steps: int,
     amplitude: float,
     std: float = 0.10,
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
-    """MAIN TERM: the trunk leans with the phase, ``exp(−((roll−A·sin2πφ)/std)²)``.
+    """MAIN walk term: the trunk leans with the step rhythm (the bounce's look).
 
-    The reference peaks mid-stance-half, i.e. when the opposite foot is up —
-    that is what makes the motion read as a weight shift, not a wobble.
+    ``exp(−((roll − A·sin(2π·N_STEPS·ℓ/WALK_END))/std)²)``. Outside the walk
+    window the reference is 0, so the same term also asks for a level trunk
+    while the robot stands and squats.
     """
-    command = env.command_manager.get_command(command_name)
-    assert command is not None, f"Command '{command_name}' not found."
     asset: Entity = env.scene[asset_cfg.name]
-    reference = bounce_roll_reference(bounce_phase(command), amplitude)
-    error = _bounce_trunk_roll(asset) - reference
-    return torch.exp(-((error / std) ** 2))
+    local = dance_local_phase(_dance_command(env, command_name), n_reps)
+    reference = dance_sway_reference(local, walk_end, n_steps, amplitude)
+    return torch.exp(-(((_dance_trunk_roll(asset) - reference) / std) ** 2))
 
 
-def bounce_roll_l1(
+def dance_sway_l1(
     env: ManagerBasedRlEnv,
     command_name: str,
+    n_reps: int,
+    walk_end: float,
+    n_steps: int,
     amplitude: float,
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
-    """L1 bootstrap for the roll error (≤ 0 → POSITIVE weight).
+    """L1 bootstrap on the sway error (≤ 0 → POSITIVE weight).
 
-    The Gaussian above is nearly flat at the sway peaks (12° vs a 0.10 rad std),
-    so the first half-cycle needs a linear term to have any gradient.
+    The Gaussian above is nearly flat at the sway peaks (15° of lean against a
+    0.10 rad std), so the first cycle needs a linear term to have a gradient.
     """
-    command = env.command_manager.get_command(command_name)
-    assert command is not None, f"Command '{command_name}' not found."
     asset: Entity = env.scene[asset_cfg.name]
-    reference = bounce_roll_reference(bounce_phase(command), amplitude)
-    return -torch.abs(_bounce_trunk_roll(asset) - reference)
+    local = dance_local_phase(_dance_command(env, command_name), n_reps)
+    reference = dance_sway_reference(local, walk_end, n_steps, amplitude)
+    return -(_dance_trunk_roll(asset) - reference).abs()
 
 
-def bounce_lift_tracking(
+def dance_step_tracking(
     env: ManagerBasedRlEnv,
     command_name: str,
     sensor_name: str,
-    half_width: float = 0.15,
-    off_window_penalty: float = 0.5,
+    n_reps: int,
+    walk_end: float,
+    n_steps: int,
 ) -> torch.Tensor:
-    """The scheduled foot is OFF the ground, ONLY inside its flight window.
+    """The scheduled foot is OFF the ground; the other foot is not graded.
 
-    +1 when the scheduled foot is up near its sway peak; −``off_window_penalty``
-    whenever ANY foot is up outside both windows. The body must be planted at the
-    hand-overs, so the move is one bounded hop per half-cycle — without this the
-    per-step lift reward is farmed by keeping the feet airborne continuously
-    (2026-10-02: `foot air L 1.00 R 1.00`, sway 0.3°, drift 0.74 m).
-
-    The other foot may be up too WHILE the window is open (both feet leaving the
-    ground together is the bounce); it is never graded otherwise.
+    Phase-gated stand-in for the stock `feet_air_time`, whose
+    ``command_threshold`` gate can never close here (the twist slot carries a
+    unit-circle phase) — it would keep paying for lifting a foot during the
+    stand and squat windows.
     """
-    command = env.command_manager.get_command(command_name)
-    assert command is not None, f"Command '{command_name}' not found."
-    phase = bounce_phase(command)
-    window = bounce_lift_window(phase, half_width)
-    schedule = bounce_lift_schedule(phase)
+    local = dance_local_phase(_dance_command(env, command_name), n_reps)
+    schedule = dance_step_schedule(local, walk_end, n_steps)
     air_time = env.scene[sensor_name].data.current_air_time
     assert air_time is not None, f"Sensor '{sensor_name}' has no air-time field."
     airborne = torch.stack(
@@ -5216,98 +5270,159 @@ def bounce_lift_tracking(
         ),
         dim=-1,
     )
-    window_open = window.max(dim=-1).values
-    credit = window_open * (schedule * airborne).sum(dim=-1)
-    any_airborne = airborne.max(dim=-1).values
-    return credit - off_window_penalty * (1.0 - window_open) * any_airborne
+    return (schedule * airborne).sum(dim=-1)
+
+
+def dance_forward_progress(
+    env: ManagerBasedRlEnv,
+    command_name: str,
+    n_reps: int,
+    walk_end: float,
+    target_distance: float,
+    max_paid_rate: float = 0.5,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """MAIN walk term: pay increments of the furthest forward ground covered.
+
+    Potential-based (the roulade recipe), so marching in place, rocking and
+    standing all pay 0/step — only NEW forward displacement pays. Paid only
+    while the walk window is open (drift during a squat is not a walk), and the
+    increment is capped at ``max_paid_rate`` m/s so lunging or falling forward
+    cannot out-earn stepping. ``target_distance`` is the whole-routine budget
+    (both repetitions together).
+    """
+    asset: Entity = env.scene[asset_cfg.name]
+    local = dance_local_phase(_dance_command(env, command_name), n_reps)
+
+    frontier = torch.maximum(env._dance_fwd_max, _dance_forward_offset(env, asset))
+    delta = torch.clamp(frontier - env._dance_fwd_paid, min=0.0)
+    delta = torch.clamp(delta, max=max_paid_rate * env.step_dt)
+    env._dance_fwd_max = frontier
+    env._dance_fwd_paid = torch.maximum(env._dance_fwd_paid, frontier)
+
+    in_walk = (local < walk_end).to(torch.float32)
+    return in_walk * delta / target_distance
+
+
+def dance_heading_l1(
+    env: ManagerBasedRlEnv,
+    command_name: str,
+    n_reps: int,
+    walk_end: float,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """−|yaw − spawn yaw| during the walk windows (≤ 0 → POSITIVE weight).
+
+    The walker drifts ~6–8°/s open-loop (measured in the CPU/BAM rehearsal), so
+    three steps would leave the robot visibly turned and the second repetition
+    would start crooked. Gated to the walk windows: the squat makes a small yaw
+    wobble of its own, and that is not worth taxing.
+    """
+    asset: Entity = env.scene[asset_cfg.name]
+    local = dance_local_phase(_dance_command(env, command_name), n_reps)
+    in_walk = (local < walk_end).to(torch.float32)
+    return -wrap_to_pi(_dance_trunk_yaw(asset) - env._dance_origin_yaw).abs() * in_walk
 
 
 # --------------------------------------------------------------------------- #
-# Bounce — keep it on the spot and upright                                      #
+# Dance — the stand and the squats                                              #
 # --------------------------------------------------------------------------- #
-def bounce_stay_in_place(
+def dance_squat_tracking(
     env: ManagerBasedRlEnv,
-    command_name: str = "twist",
-    std_forward: float = 0.05,
-    std_lateral: float = 0.15,
+    command_name: str,
+    n_reps: int,
+    walk_end: float,
+    squat_start: float,
+    n_squats: int,
+    stand_z: float,
+    depth: float,
+    std: float = 0.015,
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
-    """Reward being centred when the sway crosses zero (see bounce_centre_gate).
+    """MAIN stand/squat term: Gaussian on trunk height against the phase target.
 
-    Anisotropic on purpose: the sway legitimately moves the trunk a few cm
-    SIDEWAYS, so y stays loose, while forward (x) displacement is never part of
-    the move and is priced ~3x tighter to stop the forward creep.
-    """
-    command = env.command_manager.get_command(command_name)
-    assert command is not None, f"Command '{command_name}' not found."
-    asset: Entity = env.scene[asset_cfg.name]
-    centred = bounce_centre_gate(bounce_phase(command))
-    d = _bounce_drift_vec(env, asset)
-    error_sq = (d[:, 0] / std_forward) ** 2 + (d[:, 1] / std_lateral) ** 2
-    return centred * torch.exp(-error_sq)
-
-
-def bounce_stay_in_place_l1(
-    env: ManagerBasedRlEnv,
-    command_name: str = "twist",
-    forward_gain: float = 3.0,
-    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
-) -> torch.Tensor:
-    """Gated L1 companion (≤ 0 → POSITIVE weight): constant gradient on the
-    NET drift, so a robot that has walked off the spot keeps being pulled back.
-    The forward axis is weighted harder — see `bounce_stay_in_place`."""
-    command = env.command_manager.get_command(command_name)
-    assert command is not None, f"Command '{command_name}' not found."
-    asset: Entity = env.scene[asset_cfg.name]
-    d = _bounce_drift_vec(env, asset)
-    priced = torch.sqrt((forward_gain * d[:, 0]) ** 2 + d[:, 1] ** 2)
-    return -bounce_centre_gate(bounce_phase(command)) * priced
-
-
-def bounce_yaw_rate_l1(
-    env: ManagerBasedRlEnv,
-    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
-) -> torch.Tensor:
-    """Yaw-rate containment (≤ 0 → POSITIVE weight): ``−|ω_z|``.
-
-    The anti-spin term. Yaw RATE is the only rotation quantity the actor can
-    observe (``base_ang_vel`` is in the 61D obs), so this is directly learnable,
-    unlike yaw angle. A constant penalty on the instantaneous rate kills both a
-    systematic drift torque and random yaw wobble. The weight is deliberately
-    far below the sway/lift terms: cutting the sway would barely pay back here,
-    so the bounce amplitude is protected by reward mass (still watch
-    `bounce_sway_amp_deg` and lower the weight if it ever drops).
+    Inactive during the walk (the bouncy gait is allowed to bob vertically), so
+    it does not fight the sway: the reference is only judged from the moment the
+    robot is asked to settle.
     """
     asset: Entity = env.scene[asset_cfg.name]
-    rate = torch.nan_to_num(asset.data.root_link_ang_vel_b[:, 2], nan=0.0)
-    return -rate.abs()
+    local = dance_local_phase(_dance_command(env, command_name), n_reps)
+    reference = dance_squat_height_reference(local, squat_start, n_squats, stand_z, depth)
+    error = _dance_trunk_height(env, asset) - reference
+    planted = (local >= walk_end).to(torch.float32)
+    return torch.exp(-((error / std) ** 2)) * planted
 
 
-def bounce_pitch_balance(
+def dance_squat_l1(
+    env: ManagerBasedRlEnv,
+    command_name: str,
+    n_reps: int,
+    walk_end: float,
+    squat_start: float,
+    n_squats: int,
+    stand_z: float,
+    depth: float,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """L1 companion to the height Gaussian (≤ 0 → POSITIVE weight).
+
+    Normalised by ``depth`` so the term stays O(1): the dip is spent one depth
+    away from the reference, and the Gaussian alone is flat there until the
+    policy has already found it.
+    """
+    asset: Entity = env.scene[asset_cfg.name]
+    local = dance_local_phase(_dance_command(env, command_name), n_reps)
+    reference = dance_squat_height_reference(local, squat_start, n_squats, stand_z, depth)
+    error = (_dance_trunk_height(env, asset) - reference).abs() / depth
+    planted = (local >= walk_end).to(torch.float32)
+    return -error * planted
+
+
+def dance_feet_level_l1(
+    env: ManagerBasedRlEnv,
+    command_name: str,
+    n_reps: int,
+    walk_end: float,
+    feet_cfg: SceneEntityCfg,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """−|fore/aft offset between the feet| after the walk (≤ 0 → POSITIVE weight).
+
+    "站稳后脚不要前后岔开": three steps already land the feet within a few mm of
+    level, so this only closes the last gap and keeps them level through the
+    squats. Lateral stance is left free on purpose.
+    """
+    asset: Entity = env.scene[asset_cfg.name]
+    local = dance_local_phase(_dance_command(env, command_name), n_reps)
+    planted = (local >= walk_end).to(torch.float32)
+    return -_dance_feet_fore_aft(asset, feet_cfg).abs() * planted
+
+
+def dance_pitch_balance(
     env: ManagerBasedRlEnv,
     std: float = 0.15,
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
-    """Trunk pitch near level — the bounce's balance term.
+    """Trunk pitch near level — replaces the stock `upright`.
 
-    Replaces the stock `upright`, which also penalises roll; roll is the task
-    here, so only fore/aft is priced.
+    `upright` penalises roll as well, and roll is what the sway asks for, so
+    only fore/aft is priced.
     """
     asset: Entity = env.scene[asset_cfg.name]
     g = torch.nan_to_num(asset.data.projected_gravity_b, nan=0.0)
-    pitch = torch.asin(g[:, 0].clamp(-1.0, 1.0))
-    return torch.exp(-((pitch / std) ** 2))
+    return torch.exp(-((torch.asin(g[:, 0].clamp(-1.0, 1.0)) / std) ** 2))
 
 
-def bounce_head_hold(
+def dance_head_hold(
     env: ManagerBasedRlEnv,
     std: float = 0.30,
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
     """Keep the four head/neck joints near HOME (one term, not four).
 
-    The head is 38 % of the mass and should not flail; a generous std leaves it
-    free to act as a counterweight.
+    The head is 38 % of the mass and must not flail; a generous std leaves it
+    free to act as a counterweight. The legs are anchored by the `pose` reward,
+    which deliberately excludes the head so this is the head's only constraint.
     """
     asset: Entity = env.scene[asset_cfg.name]
     ids = []
@@ -5322,83 +5437,71 @@ def bounce_head_hold(
 
 
 # --------------------------------------------------------------------------- #
-# Bounce — diagnostics (MetricsManager; no reward weight, no dt scaling)        #
+# Dance — diagnostics (MetricsManager; no reward weight, no dt scaling)         #
 # --------------------------------------------------------------------------- #
-def bounce_metric_sway_amp_deg(
-    env: ManagerBasedRlEnv,
-    command_name: str = "twist",
-    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
-) -> torch.Tensor:
-    """Sway amplitude in phase with the reference (degrees).
-
-    ``2·roll·sin(2πφ)`` with ``reduce="mean"``: the episode average of that
-    product is the part of the roll in phase with the commanded sinusoid. Used
-    instead of (max−min)/2, which a single outlier sets (a run once reported
-    20.6° against a 12° reference with only 3.2° mean error).
-    """
-    command = env.command_manager.get_command(command_name)
-    assert command is not None, f"Command '{command_name}' not found."
-    asset: Entity = env.scene[asset_cfg.name]
-    reference_shape = torch.sin(2.0 * math.pi * bounce_phase(command))
-    return 2.0 * _bounce_trunk_roll(asset) * reference_shape * _DEG
-
-
-def bounce_metric_roll_error_deg(
+def dance_metric_sway_amp_deg(
     env: ManagerBasedRlEnv,
     command_name: str,
-    amplitude: float,
+    n_reps: int,
+    walk_end: float,
+    n_steps: int,
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
-    """|actual − commanded roll| in degrees (per-step average)."""
-    command = env.command_manager.get_command(command_name)
-    asset: Entity = env.scene[asset_cfg.name]
-    reference = bounce_roll_reference(bounce_phase(command), amplitude)
-    return (_bounce_trunk_roll(asset) - reference).abs() * _DEG
+    """Sway amplitude in phase with the reference (degrees), walk window only.
 
-
-def bounce_metric_foot_air_frac(
-    env: ManagerBasedRlEnv,
-    sensor_name: str,
-    foot: int,
-    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
-) -> torch.Tensor:
-    """Fraction of steps the given foot spends off the ground (0 = LEFT, 1 = RIGHT)."""
-    air_time = env.scene[sensor_name].data.current_air_time
-    assert air_time is not None
-    assert foot in (0, 1)
-    return (air_time[:, foot] > 0.0).to(torch.float32)
-
-
-def bounce_metric_drift_m(
-    env: ManagerBasedRlEnv,
-    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
-) -> torch.Tensor:
-    """Distance of the trunk from where the bounce started (m)."""
-    return _bounce_drift(env, env.scene[asset_cfg.name])
-
-
-def bounce_metric_pitch_deg(
-    env: ManagerBasedRlEnv,
-    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
-) -> torch.Tensor:
-    """Trunk pitch (degrees). Negative = leaning BACKWARD."""
-    asset: Entity = env.scene[asset_cfg.name]
-    g = torch.nan_to_num(asset.data.projected_gravity_b, nan=0.0)
-    return torch.asin(g[:, 0].clamp(-1.0, 1.0)) * _DEG
-
-
-def bounce_metric_yaw_rate_deg_s(
-    env: ManagerBasedRlEnv,
-    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
-) -> torch.Tensor:
-    """Signed trunk yaw rate (deg/s); read with ``reduce="mean"``.
-
-    Episode mean ≈ 0 = yaw wobble that cancels; a persistent sign = systematic
-    drift. This is the number to read before touching the weight.
+    ``2·roll·sin(2π·N_STEPS·ℓ/WALK_END)`` — its episode average (reduce="mean")
+    is the part of the roll in phase with the commanded rhythm, which one
+    outlier cannot set.
     """
     asset: Entity = env.scene[asset_cfg.name]
-    rate = torch.nan_to_num(asset.data.root_link_ang_vel_b[:, 2], nan=0.0)
-    return rate * _DEG
+    local = dance_local_phase(_dance_command(env, command_name), n_reps)
+    shape = torch.sin(2.0 * math.pi * n_steps * local / walk_end)
+    in_walk = (local < walk_end).to(torch.float32)
+    return 2.0 * _dance_trunk_roll(asset) * shape * in_walk * _DEG
+
+
+def dance_metric_forward_m(
+    env: ManagerBasedRlEnv,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Forward distance covered since the reset pose (m)."""
+    return _dance_forward_offset(env, env.scene[asset_cfg.name])
+
+
+def dance_metric_height_err_mm(
+    env: ManagerBasedRlEnv,
+    command_name: str,
+    n_reps: int,
+    squat_start: float,
+    n_squats: int,
+    stand_z: float,
+    depth: float,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """|trunk height − phase target| (mm). Read this before touching the squat."""
+    asset: Entity = env.scene[asset_cfg.name]
+    local = dance_local_phase(_dance_command(env, command_name), n_reps)
+    reference = dance_squat_height_reference(local, squat_start, n_squats, stand_z, depth)
+    return (_dance_trunk_height(env, asset) - reference).abs() * 1000.0
+
+
+def dance_metric_yaw_drift_deg(
+    env: ManagerBasedRlEnv,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """|trunk yaw − spawn yaw| (degrees)."""
+    asset: Entity = env.scene[asset_cfg.name]
+    return wrap_to_pi(_dance_trunk_yaw(asset) - env._dance_origin_yaw).abs() * _DEG
+
+
+def dance_metric_feet_fore_aft_mm(
+    env: ManagerBasedRlEnv,
+    feet_cfg: SceneEntityCfg,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Fore/aft offset between the feet (mm). ~0 = level stance."""
+    asset: Entity = env.scene[asset_cfg.name]
+    return _dance_feet_fore_aft(asset, feet_cfg).abs() * 1000.0
 
 
 # --------------------------------------------------------------------------- #

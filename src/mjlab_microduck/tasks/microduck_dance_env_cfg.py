@@ -1,21 +1,26 @@
-"""Microduck bounce (dance) task.
+"""Microduck dance routine — walk three steps, stand, squat three times (×2).
 
-Episodic phase policy: an exaggerated bouncy weight shift in place — the feet
-leave the ground, the body leans left with the right foot up, then right with the
-left foot up. One bounce cycle (``BOUNCE_PERIOD_S``):
+Episodic phase policy replacing the in-place bounce (2026-10-03: the bounce
+itself tracked well, but a move whose feet are mostly airborne cannot hold a
+heading — it drifted ~0.9 m per 5 s episode). The routine walks instead, so the
+feet have traction and the heading is controllable:
 
-    φ ∈ [0.00, 0.50)   trunk leans LEFT, the RIGHT foot is the one that lifts
-    φ ∈ [0.50, 1.00)   trunk leans RIGHT, the LEFT foot is the one that lifts
+    one period (``DANCE_PERIOD_S``) = N_REPS repetitions, each split into
+      ℓ ∈ [0, WALK_END)            walk forward N_STEPS exaggerated steps
+      ℓ ∈ [WALK_END, SQUAT_START)  stand still
+      ℓ ∈ [SQUAT_START, 1.0)       N_SQUATS quick shallow squats
 
-Two terms make the move: `bounce_roll_tracking` (sway) and `bounce_lift_tracking`
-(foot lift). Everything else is a stock regulariser or containment ("do not
-travel / do not tip over"). Phase travels in the twist slot as
-``[cos(2πφ), sin(2πφ), 0]``, the runtime one-shot contract, so
-`GroundPickPhaseCommand` is reused unchanged.
+The walk keeps the bounce's look: the trunk sways with the step rhythm (one lean
+per step, ~15° — ``DANCE_SWAY_DEG``) and the right foot lifts while the trunk
+leans left. ``dance_sway_tracking`` + ``dance_step_tracking`` shape that;
+``dance_forward_progress`` pays only for new forward ground (potential-based, so
+marching in place pays nothing) and ``dance_heading_l1`` keeps the three steps
+straight. ``dance_squat_tracking`` anchors the trunk height from the moment the
+robot is asked to settle and drives the three 1.5 cm dips.
 
-The commanded yaw revolution was removed (2026-10-02): the move is a pure
-in-place bounce now. Key metrics: `bounce_sway_amp_deg` (is the sway big
-enough), `bounce_roll_error_deg` (≈ 0), `bounce_drift_m` (did it stay put).
+Phase travels in the twist slot as ``[cos(2πφ), sin(2πφ), 0]`` — the runtime
+one-shot contract — so `GroundPickPhaseCommand` is reused unchanged. Read
+``Episode_Metrics/dance_*`` before touching a reward.
 """
 
 import math
@@ -81,25 +86,36 @@ ENCODER_BIAS_RANGE = (-0.015, 0.015)  # ±0.86° per-joint encoder offset (const
 BASE_ORIENTATION_MAX_PITCH_DEG = 10.0  # ±10° forward/backward tilt at episode start
 BASE_ORIENTATION_MAX_ROLL_DEG = 5.0  # ±5° side-to-side tilt at episode start
 
-# Bounce timing and geometry — one left lean + one right lean per cycle
-BOUNCE_PERIOD_S = 1.0        # 0.5 s per side: one full bounce per second
+# Routine timing. One period is one full routine (both repetitions) and the
+# episode is exactly one period, so the phase starts and ends at φ = 0 (the
+# standing hand-over the runtime button presses give).
+N_REPS = 2
+DANCE_PERIOD_S = 7.0
+EPISODE_LENGTH_S = DANCE_PERIOD_S              # 350 steps @ 50 Hz
+# 3.5 s per repetition: walk 1.5 s (3 steps @ 0.5 s), stand 0.5 s, squat 1.5 s
+# (3 dips @ 0.5 s) — the "under two seconds" the quick squats were asked to fit.
+WALK_END = 1.5 / (DANCE_PERIOD_S / N_REPS)
+SQUAT_START = 2.0 / (DANCE_PERIOD_S / N_REPS)
+N_STEPS = 3
+N_SQUATS = 3
 
-# 3 s = 3 full bounce cycles. The move is periodic, so the episode is just the
-# cycle count the trick wants (previously 12 s was turn padding).
-EPISODE_LENGTH_S = 3.0                         # 3 full cycles (150 steps @50 Hz)
+# Sway amplitude at each step's mid-stance. 12° was the minimum that unloads the
+# other foot on the bounce; the walk is asked for the same look but exaggerated
+# (15°), which the walk's ground contact can now afford.
+DANCE_SWAY_DEG = 15.0
+DANCE_SWAY_AMPLITUDE = math.radians(DANCE_SWAY_DEG)
 
-# A foot may only be off the ground near its own sway peak (RIGHT at φ=0.25,
-# LEFT at φ=0.75); this is ±0.15 of the cycle ≈ ±0.15 s around the peak. Without
-# it the per-step lift reward is farmed by continuously flapping the feet
-# (2026-10-02: `foot air L 1.00 R 1.00`). `OFF_WINDOW_PENALTY` is the penalty
-# applied per step while ANY foot is airborne outside both windows.
-BOUNCE_LIFT_WINDOW = 0.15
-BOUNCE_OFF_WINDOW_PENALTY = 0.5
-# Target roll at the peak of each stance half. The stance foot's inner edge is
-# at y=+21.2 mm and its centre at +40.7 mm with the CoM 148 mm up, so ~8° is the
-# minimum to unload the other foot and ~15° centres the CoM over it.
-BOUNCE_SWAY_DEG = 12.0
-BOUNCE_SWAY_AMPLITUDE = math.radians(BOUNCE_SWAY_DEG)
+# Trunk height (m) at the stand, measured in sim under a standing policy, and
+# the squat dip below it. The dip is deliberately small — the point is that the
+# squat is *visible*, not that it is deep; 15 mm is roughly a knee+0.5 rad squat.
+DANCE_STAND_Z = 0.114
+DANCE_SQUAT_DEPTH = 0.015
+
+# Forward budget for the whole routine (both repetitions), measured on the
+# walking policy in the CPU/BAM rehearsal: ~10 cm per three-step walk at the
+# speed the robot can actually reach. Paid as potential-based progress, so this
+# is a distance the policy must cover, not a per-step rate it can farm.
+DANCE_FORWARD_M = 0.22
 
 import mujoco as _mujoco
 import mjlab.terrains as terrain_gen
@@ -294,8 +310,9 @@ def make_microduck_dance_env_cfg(
     cfg.rewards["pose"].params["std_standing"] = std_standing  # tight when command=0
     cfg.rewards["pose"].params["std_walking"] = std_walking
     cfg.rewards["pose"].params["std_running"] = std_walking
-    # Pose reward operates on LEG joints only. Head direction is handled by
-    # bounce_head_hold, so keep head/neck out of this HOME-pulling term.
+    # Pose reward operates on LEG joints only: the head is 38 % of the mass and
+    # gets its own, gentler hold (`dance_head_hold`) so it can still act as a
+    # counterweight.
     cfg.rewards["pose"].params["asset_cfg"] = SceneEntityCfg(
         "robot", joint_names=(r"^(?!passive_|.*neck.*|.*head.*).*",)
     )
@@ -303,8 +320,8 @@ def make_microduck_dance_env_cfg(
     cfg.rewards["pose"].weight = 1.0
 
     # NOTE: the stock `upright` term is dropped further down — it penalises roll
-    # as well as pitch, and roll is exactly what this move is asked to produce.
-    # Its replacement, `bounce_pitch_balance`, keeps the pitch half only.
+    # as well as pitch, and roll is exactly what the sway is asked to produce.
+    # Its replacement, `dance_pitch_balance`, keeps the pitch half only.
 
     # foot_clearance and foot_slip still read foot sites from asset_cfg.
     for reward_name in ["foot_clearance", "foot_slip"]:
@@ -325,160 +342,154 @@ def make_microduck_dance_env_cfg(
         params={"sensor_name": self_collision_cfg.name},
     )
 
-    # --- The move: sway + lift -------------------------------------------------
-    # Two terms: sway and foot lift. Both are phase-referenced, so neither can be
-    # farmed by standing still.
-    bounce_cmd = {"command_name": "twist"}
+    # --- The walk: sway, three steps, forward ---------------------------------
+    # Every term below is phase-referenced, so none of them can be farmed by
+    # standing still and none of them keeps paying during the stand/squat windows.
+    dance_cmd = {"command_name": "twist", "n_reps": N_REPS}
+    walk_params = {**dance_cmd, "walk_end": WALK_END}
+    sway_params = {**walk_params, "n_steps": N_STEPS}
 
-    cfg.rewards["bounce_roll_tracking"] = RewardTermCfg(
-        func=microduck_mdp.bounce_roll_tracking,
+    cfg.rewards["dance_sway_tracking"] = RewardTermCfg(
+        func=microduck_mdp.dance_sway_tracking,
         weight=5.0,
-        params={**bounce_cmd, "amplitude": BOUNCE_SWAY_AMPLITUDE, "std": 0.10},
+        params={**sway_params, "amplitude": DANCE_SWAY_AMPLITUDE, "std": 0.10},
     )
 
     # L1 bootstrap on the same error (≤ 0 → POSITIVE weight): at the sway peaks
-    # the Gaussian is nearly flat, so the first half-cycle needs a linear term.
-    cfg.rewards["bounce_roll_l1"] = RewardTermCfg(
-        func=microduck_mdp.bounce_roll_l1,
+    # the Gaussian is nearly flat, so the first cycle needs a linear term.
+    cfg.rewards["dance_sway_l1"] = RewardTermCfg(
+        func=microduck_mdp.dance_sway_l1,
         weight=0.6,
-        params={**bounce_cmd, "amplitude": BOUNCE_SWAY_AMPLITUDE},
+        params={**sway_params, "amplitude": DANCE_SWAY_AMPLITUDE},
     )
 
-    cfg.rewards["bounce_lift_tracking"] = RewardTermCfg(
-        func=microduck_mdp.bounce_lift_tracking,
+    # Phase-gated replacement for the stock `air_time` (see the mdp docstring).
+    cfg.rewards["dance_step_tracking"] = RewardTermCfg(
+        func=microduck_mdp.dance_step_tracking,
         weight=3.0,
-        params={
-            **bounce_cmd,
-            "sensor_name": feet_ground_cfg.name,
-            # Flight only around the sway peaks, penalty for any foot air
-            # outside them — this is what pins "one bounce per half-cycle".
-            "half_width": BOUNCE_LIFT_WINDOW,
-            "off_window_penalty": BOUNCE_OFF_WINDOW_PENALTY,
-        },
+        params={**sway_params, "sensor_name": feet_ground_cfg.name},
     )
 
-    # --- Keep it on the spot, upright, and calm --------------------------------
-    # Drift pressure is aimed at the NET drift only, and is ANISOTROPIC: the sway
-    # legitimately moves the trunk a few cm sideways (y), so y stays loose
-    # (15 cm) while forward (x) is priced ~3x tighter (5 cm) to kill the forward
-    # creep. Both are gated by `bounce_centre_gate` (read where the body passes
-    # upright over the centre), so the sway itself is never taxed.
-    cfg.rewards["bounce_stay_in_place"] = RewardTermCfg(
-        func=microduck_mdp.bounce_stay_in_place,
-        weight=1.5,
-        params={**bounce_cmd, "std_forward": 0.05, "std_lateral": 0.15},
+    cfg.rewards["dance_forward_progress"] = RewardTermCfg(
+        func=microduck_mdp.dance_forward_progress,
+        weight=4.0,
+        params={**walk_params, "target_distance": DANCE_FORWARD_M},
     )
-    cfg.rewards["bounce_stay_in_place_l1"] = RewardTermCfg(
-        func=microduck_mdp.bounce_stay_in_place_l1,
-        # 3.0 → 1.0: at 3.0 it was the third-largest cost while the robot still
-        # travelled 1.1 m; kept as a gentle bias. forward_gain=3 concentrates
-        # what force there is on the axis that actually drifts.
+
+    # The walker drifts 6–8°/s open loop, so three steps would visibly turn the
+    # robot and the second repetition would start crooked (≤ 0 → POSITIVE weight).
+    cfg.rewards["dance_heading_l1"] = RewardTermCfg(
+        func=microduck_mdp.dance_heading_l1,
         weight=1.0,
-        params={**bounce_cmd, "forward_gain": 3.0},
+        params=walk_params,
     )
-    # NOTE: the commanded yaw revolution (`bounce_turn_rate_tracking` /
-    # `bounce_turn_angle_l1`) and its measurement terms were removed
-    # (2026-10-02) — the move is a pure in-place bounce now.
-    # In their place, one small yaw-RATE containment term stops the body
-    # wandering in heading (ω_z is observable, so it is learnable). Kept well
-    # under the sway/lift weights so the bounce amplitude cannot be traded away
-    # to buy it.
-    cfg.rewards["bounce_yaw_rate_l1"] = RewardTermCfg(
-        func=microduck_mdp.bounce_yaw_rate_l1,
-        weight=0.5,  # ≤ 0 → POSITIVE weight. ~0.2/step at 0.4 rad/s, vs sway 5.0
+
+    # --- The stand and the quick squats ---------------------------------------
+    squat_params = {
+        **dance_cmd,
+        "squat_start": SQUAT_START,
+        "n_squats": N_SQUATS,
+        "stand_z": DANCE_STAND_Z,
+        "depth": DANCE_SQUAT_DEPTH,
+    }
+
+    cfg.rewards["dance_squat_tracking"] = RewardTermCfg(
+        func=microduck_mdp.dance_squat_tracking,
+        weight=4.0,
+        params={**squat_params, "walk_end": WALK_END, "std": 0.015},
     )
+
+    # L1 companion (≤ 0 → POSITIVE weight), normalised by the depth so it stays
+    # O(1): the Gaussian alone is flat until the policy has found the dip.
+    cfg.rewards["dance_squat_l1"] = RewardTermCfg(
+        func=microduck_mdp.dance_squat_l1,
+        weight=0.5,
+        params={**squat_params, "walk_end": WALK_END},
+    )
+
+    # "站稳后脚不要前后岔开" (≤ 0 → POSITIVE weight). Lateral stance is not
+    # priced: feet apart is wanted, and the gait already lands them ~84 mm apart.
+    cfg.rewards["dance_feet_level_l1"] = RewardTermCfg(
+        func=microduck_mdp.dance_feet_level_l1,
+        weight=1.0,
+        params={**walk_params, "feet_cfg": SceneEntityCfg("robot", site_names=site_names)},
+    )
+
     # Balance = pitch only. The stock `upright` penalises roll too, and roll is
-    # what this move is asked to produce, so it is replaced rather than tuned.
+    # what the sway is asked to produce, so it is replaced rather than tuned.
     cfg.rewards.pop("upright", None)
-    cfg.rewards["bounce_pitch_balance"] = RewardTermCfg(
-        func=microduck_mdp.bounce_pitch_balance,
+    cfg.rewards["dance_pitch_balance"] = RewardTermCfg(
+        func=microduck_mdp.dance_pitch_balance,
         weight=2.0,
         params={"std": 0.15},
     )
 
-    # One head term instead of four: the head is 38 % of the mass and should not
-    # flail, but this move asks nothing else of it.
-    cfg.rewards["bounce_head_hold"] = RewardTermCfg(
-        func=microduck_mdp.bounce_head_hold,
+    # One head term instead of four. The head must not flail (it is 38 % of the
+    # mass), but a generous std leaves it free to counterbalance the walk.
+    cfg.rewards["dance_head_hold"] = RewardTermCfg(
+        func=microduck_mdp.dance_head_hold,
         weight=0.4,
         params={"std": 0.30},
     )
 
     # `track_*_velocity` compare the twist slot to real velocities. The slot now
     # carries the phase pair [cos, sin, 0], so both would be tracking a unit
-    # circle as if it were m/s — removed, not re-weighted. Position/heading
-    # drift is priced by the bounce_* terms above.
+    # circle as if it were m/s — removed, not re-weighted. Forward travel and
+    # heading are priced by the dance_* terms above.
     cfg.rewards.pop("track_linear_velocity", None)
     cfg.rewards.pop("track_angular_velocity", None)
 
-    # `pose` stays as the leg-posture anchor (it is what stopped the splayed-leg
-    # freeze), but below the task terms.
-    cfg.rewards["pose"].weight = 0.5
+    # `pose` is the leg-posture anchor that stops the splayed-leg freeze. It
+    # mildly opposes the squat's knee bend, but the height terms outbid it.
+    cfg.rewards["pose"].weight = 2.0
 
-    cfg.rewards["air_time"].weight = 3.0
-    cfg.rewards["air_time"].params["threshold_min"] = 0.125
-    cfg.rewards["air_time"].params["threshold_max"] = 0.300
+    # `air_time` is gone: dance_step_tracking is its phase-gated replacement.
+    del cfg.rewards["air_time"]
 
-    cfg.rewards["foot_clearance"].params["target_height"] = 0.02
-
-    cfg.rewards["foot_swing_height"].params["target_height"] = 0.02
-
-    # The gait-shaping terms self-gate on |cmd_xy| + |cmd_z|. The bounce slot
-    # carries [cos, sin, 0] (unit circle) and the bounce never stops, so the gate
-    # is always open — which is what a continuous step-in-place wants.
-    for _term in ("air_time", "foot_clearance", "foot_swing_height", "foot_slip"):
+    # Foot shaping for the exaggerated steps. These three all scale with the
+    # foot's own velocity, so they are inert while the robot stands and squats —
+    # only their `command_threshold` gate is meaningless here (the twist slot is
+    # a unit-circle phase), so it is simply left low enough to stay armed.
+    cfg.rewards["foot_clearance"].params["target_height"] = 0.03
+    cfg.rewards["foot_swing_height"].params["target_height"] = 0.03
+    for _term in ("foot_clearance", "foot_swing_height", "foot_slip"):
         cfg.rewards[_term].params["command_threshold"] = 0.1
-
     cfg.rewards["foot_slip"].weight = -0.4
 
     # Trunk pitch/roll rate: damps the sway instead of forbidding it. Kept small
-    # on purpose — the move IS a trunk rotation, so this must not out-bid it.
+    # on purpose — the sway IS a trunk rotation, so this must not out-bid it.
     cfg.rewards["body_ang_vel"].weight = -0.05
     cfg.rewards["angular_momentum"].weight = -0.02
 
-    # Action smoothness (curriculum below keeps tightening it). The previous
-    # turn task chattered at ~29.5 summed over 14 joints; a bounce is a rhythm,
-    # not a whip, so smoothing is priced from the start.
+    # Action smoothness (the curriculum below keeps tightening it). A routine is
+    # a rhythm, not a whip, so smoothing is priced from the start.
     cfg.rewards["action_rate_l2"].weight = -0.08
 
     # --- Diagnostics --------------------------------------------------------
     # mjlab's MetricsManager: no reward weight, no dt scaling, logged as
-    # `Episode_Metrics/bounce_*`. `reduce="last"` = value at the FINAL step of the
-    # episode (sway amplitude reached, where it ended up); `reduce="mean"` for
-    # the per-step curves. These are the numbers to read before touching a
-    # reward again.
-    # `reduce="mean"`: the per-step value is 2·roll·sin(2πφ), so its episode
-    # average IS the sway amplitude in phase with the reference (outlier-robust,
-    # unlike the (max−min)/2 it replaces).
-    cfg.metrics["bounce_sway_amp_deg"] = MetricsTermCfg(
-        func=microduck_mdp.bounce_metric_sway_amp_deg,
-        params={"command_name": "twist"},
+    # `Episode_Metrics/dance_*`. `reduce="last"` = value at the FINAL step of the
+    # episode (where the routine ended up); `reduce="mean"` for the per-step
+    # curves. These are the numbers to read before touching a reward again.
+    cfg.metrics["dance_sway_amp_deg"] = MetricsTermCfg(
+        func=microduck_mdp.dance_metric_sway_amp_deg,
+        params=sway_params,
         reduce="mean",
     )
-    cfg.metrics["bounce_roll_error_deg"] = MetricsTermCfg(
-        func=microduck_mdp.bounce_metric_roll_error_deg,
-        params={"command_name": "twist", "amplitude": BOUNCE_SWAY_AMPLITUDE},
+    cfg.metrics["dance_height_err_mm"] = MetricsTermCfg(
+        func=microduck_mdp.dance_metric_height_err_mm,
+        params=squat_params,
         reduce="mean",
     )
-    cfg.metrics["bounce_left_air_frac"] = MetricsTermCfg(
-        func=microduck_mdp.bounce_metric_foot_air_frac,
-        params={"sensor_name": feet_ground_cfg.name, "foot": 0},
-        reduce="mean",
+    cfg.metrics["dance_forward_m"] = MetricsTermCfg(
+        func=microduck_mdp.dance_metric_forward_m, reduce="last"
     )
-    cfg.metrics["bounce_right_air_frac"] = MetricsTermCfg(
-        func=microduck_mdp.bounce_metric_foot_air_frac,
-        params={"sensor_name": feet_ground_cfg.name, "foot": 1},
-        reduce="mean",
+    cfg.metrics["dance_yaw_drift_deg"] = MetricsTermCfg(
+        func=microduck_mdp.dance_metric_yaw_drift_deg, reduce="last"
     )
-    cfg.metrics["bounce_drift_m"] = MetricsTermCfg(
-        func=microduck_mdp.bounce_metric_drift_m, reduce="last"
-    )
-    cfg.metrics["bounce_pitch_deg"] = MetricsTermCfg(
-        func=microduck_mdp.bounce_metric_pitch_deg, reduce="mean"
-    )
-    # Yaw-rate diagnostic: episode-mean signed rate (≈0 = wobble, sign = drift).
-    cfg.metrics["bounce_yaw_rate_deg_s"] = MetricsTermCfg(
-        func=microduck_mdp.bounce_metric_yaw_rate_deg_s, reduce="mean"
+    cfg.metrics["dance_feet_fore_aft_mm"] = MetricsTermCfg(
+        func=microduck_mdp.dance_metric_feet_fore_aft_mm,
+        params={"feet_cfg": SceneEntityCfg("robot", site_names=site_names)},
+        reduce="last",
     )
 
     # Events
@@ -494,8 +505,8 @@ def make_microduck_dance_env_cfg(
         mode="reset",
     )
 
-    cfg.events["bounce_reset_origin"] = EventTermCfg(
-        func=microduck_mdp.bounce_reset_origin,
+    cfg.events["dance_reset_origin"] = EventTermCfg(
+        func=microduck_mdp.dance_reset_origin,
         mode="reset",
     )
 
@@ -762,9 +773,10 @@ def make_microduck_dance_env_cfg(
     else:
         cfg.events.pop("encoder_bias", None)
 
-    # Replace the base velocity command with the bounce phase. The twist slot
+    # Replace the base velocity command with the routine phase. The twist slot
     # stays 3D but now carries the runtime one-shot contract
-    # [cos(2πφ), sin(2πφ), 0]; φ = 0 is the standing hand-over point.
+    # [cos(2πφ), sin(2πφ), 0]; φ = 0 is the standing hand-over point, which is
+    # where the routine starts walking.
     command = deepcopy(cfg.commands["twist"])
     command.rel_standing_envs = 0.0
     command.rel_heading_envs = 0.0
@@ -776,7 +788,7 @@ def make_microduck_dance_env_cfg(
         **{
             **command_kwargs,
             "class_type": microduck_mdp.GroundPickPhaseCommand,
-            "period": BOUNCE_PERIOD_S,
+            "period": DANCE_PERIOD_S,
             # Deployment starts at φ = 0 (standing) and the phase then runs on
             # its own clock, so every episode must start there too.
             "randomize_phase": False,
@@ -784,6 +796,8 @@ def make_microduck_dance_env_cfg(
     )
 
     # Append head + body command obs terms to both policy and critic groups.
+    # This routine does not use either slot — the runtime feeds zeros for this
+    # skill — so they are zero-padded to keep the shared 61D layout.
     # Order matters for the runtime obs layout: [twist(3), head_pose(4), body_pose(6)].
     for group in ("actor", "critic"):
         cfg.observations[group].terms["head_command"] = ObservationTermCfg(
@@ -826,7 +840,7 @@ def make_microduck_dance_env_cfg(
 
     # action_rate weight ramp. The previous turn task chattered badly at −0.05
     # (logged raw ~29.5 summed over 14 action dims ≈ 1.45 rad of target change
-    # per joint per 20 ms step), so smoothing starts higher now. A bounce is a
+    # per joint per 20 ms step), so smoothing starts higher now. A routine is a
     # rhythm, and a rhythm cannot be learned through a jittery controller.
     cfg.curriculum["action_rate_weight"] = CurriculumTermCfg(
         func=microduck_mdp.reward_weight,
