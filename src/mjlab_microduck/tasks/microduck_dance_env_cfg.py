@@ -112,9 +112,17 @@ N_REPS = 2
 WALK_S = 1.5      # 3 steps at 0.5 s — a normal walking cadence
 SWAY_S = 1.5      # 3 left-right cycles at 0.5 s — the sway's own cadence, from
                   # the version it was signed off in (15 deg, lean per half-cycle)
-DANCE_PERIOD_S = N_REPS * (WALK_S + SWAY_S)    # 6.0 s
-EPISODE_LENGTH_S = DANCE_PERIOD_S              # 300 steps @ 50 Hz
+# The routine is the repetitions, then a short closing stand. The stand is the
+# tail of the PERIOD, not of each repetition: the robot does walk-sway twice and
+# only then settles. It needs no reward terms of its own — the phase decode puts
+# every window closed and every reference level there, so the posture, pitch and
+# heading terms that already exist are what hold the robot upright.
+STAND_S = 0.5
+REPS_S = N_REPS * (WALK_S + SWAY_S)            # 6.0 s
+DANCE_PERIOD_S = REPS_S + STAND_S              # 6.5 s
+EPISODE_LENGTH_S = DANCE_PERIOD_S              # 325 steps @ 50 Hz
 WALK_END = WALK_S / (WALK_S + SWAY_S)
+REP_END = REPS_S / DANCE_PERIOD_S
 N_STEPS = 3
 N_SWAYS = 3
 
@@ -128,6 +136,12 @@ DANCE_START_PHASE_PROB = 0.35
 # signed off in.
 DANCE_SWAY_DEG = 15.0
 DANCE_SWAY_AMPLITUDE = math.radians(DANCE_SWAY_DEG)
+
+# How far into the commanded lean a lift has to be before it pays, as a fraction
+# of the reference. 0.3 = the trunk must be at least 30% of the way there while
+# the scheduled foot is up; it costs nothing near the sway's zero crossings,
+# where the reference itself is small.
+DANCE_LEAN_FRAC = 0.3
 
 # How far the walk half must carry the robot. This is the spec — the step count
 # above only sets the cadence it is covered at. Paid as potential-based progress,
@@ -366,7 +380,7 @@ def make_microduck_dance_env_cfg(
     # --- The routine: walk a set distance, then sway on the spot ---------------
     # Every term below is phase-referenced, so none of them can be farmed by
     # standing still, and each half only pays inside its own window.
-    dance_cmd = {"command_name": "twist", "n_reps": N_REPS}
+    dance_cmd = {"command_name": "twist", "n_reps": N_REPS, "rep_end": REP_END}
     walk_params = {**dance_cmd, "walk_end": WALK_END}
     sway_params = {**walk_params, "n_sways": N_SWAYS}
     step_params = {**sway_params, "n_steps": N_STEPS}
@@ -392,7 +406,12 @@ def make_microduck_dance_env_cfg(
     cfg.rewards["dance_step_tracking"] = RewardTermCfg(
         func=microduck_mdp.dance_step_tracking,
         weight=3.0,
-        params={**step_params, "sensor_name": feet_ground_cfg.name},
+        params={
+            **step_params,
+            "sensor_name": feet_ground_cfg.name,
+            "amplitude": DANCE_SWAY_AMPLITUDE,
+            "lean_frac": DANCE_LEAN_FRAC,
+        },
     )
 
     cfg.rewards["dance_forward_progress"] = RewardTermCfg(

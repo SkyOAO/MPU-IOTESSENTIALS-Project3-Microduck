@@ -17,6 +17,7 @@ import torch
 from mjlab_microduck.tasks import mdp as microduck_mdp
 from mjlab_microduck.tasks.microduck_dance_env_cfg import (
     DANCE_FORWARD_M,
+    DANCE_LEAN_FRAC,
     DANCE_PERIOD_S,
     DANCE_START_PHASE_PROB,
     DANCE_SWAY_AMPLITUDE,
@@ -25,6 +26,10 @@ from mjlab_microduck.tasks.microduck_dance_env_cfg import (
     N_REPS,
     N_STEPS,
     N_SWAYS,
+    REP_END,
+    STAND_S,
+    SWAY_S,
+    WALK_S,
     WALK_END,
     MicroduckDanceRlCfg,
     make_microduck_dance_env_cfg,
@@ -41,8 +46,17 @@ def _cmd(phases):
 
 
 def _local(t):
-    """Command slot for a repetition-local phase (inverse of dance_local_phase)."""
-    return _cmd([t / N_REPS])
+    """Command slot for a repetition-local phase (inverse of dance_local_phase).
+
+    The repetitions occupy [0, REP_END) of the period, so a local phase t in the
+    first repetition is at period phase t / N_REPS * REP_END.
+    """
+    return _cmd([t / N_REPS * REP_END])
+
+
+def _tail(frac):
+    """Command slot for `frac` of the way through the closing stand."""
+    return _cmd([REP_END + (1.0 - REP_END) * frac])
 
 
 # --------------------------------------------------------------------------- #
@@ -54,23 +68,41 @@ def test_phase_is_recovered_from_the_runtime_command_slot():
 
 
 def test_local_phase_wraps_once_per_repetition():
-    phases = torch.tensor([0.0, 0.25, 0.5, 0.75, 0.999])
-    local = microduck_mdp.dance_local_phase(_cmd(phases), N_REPS)
-    assert torch.allclose(local, (phases * N_REPS) % 1.0, atol=1e-6)
+    uint = torch.tensor([0.0, 0.25, 0.5, 0.75, 0.999])   # through the repetitions
+    local = microduck_mdp.dance_local_phase(_cmd(uint * REP_END), N_REPS, REP_END)
+    # the round trip through cos/sin/atan2 is not exact at the wrap, so compare
+    # on the circle rather than on the raw value
+    expected = (uint * N_REPS) % 1.0
+    diff = (local - expected).abs()
+    assert (torch.minimum(diff, 1.0 - diff) < 1e-4).all()
 
 
-def test_repetition_is_walk_then_sway():
+def test_the_closing_stand_reads_as_local_phase_one():
+    """The tail must close every window at once, or the robot would keep walking
+    or swaying through what is supposed to be a stand: local phase 1.0 is outside
+    the walk window, outside the sway window, and outside the step schedule."""
+    tail = microduck_mdp.dance_local_phase(_tail(0.5), N_REPS, REP_END)
+    assert tail.item() == pytest.approx(1.0)
+    assert tail.item() >= WALK_END                     # walk window closed
+    assert _sway_ref(tail.item()) == 0.0               # sway reference level
+    sched = microduck_mdp.dance_step_schedule(tail, WALK_END, N_STEPS, N_SWAYS)
+    assert sched.tolist() == [[0.0, 0.0]]              # both feet planted
+
+
+def test_repetition_is_walk_then_sway_and_the_routine_ends_standing():
     assert 0.0 < WALK_END < 1.0
-    rep = DANCE_PERIOD_S / N_REPS
+    rep = (WALK_S + SWAY_S)
     assert WALK_END * rep == pytest.approx(1.5, abs=1e-9)          # 3 steps at 0.5 s
     assert (1.0 - WALK_END) * rep == pytest.approx(1.5, abs=1e-9)  # 3 sways at 0.5 s
-    assert EPISODE_LENGTH_S == pytest.approx(N_REPS * rep)
+    assert REP_END * DANCE_PERIOD_S == pytest.approx(N_REPS * rep)
+    assert (1.0 - REP_END) * DANCE_PERIOD_S == pytest.approx(STAND_S)  # closing stand
+    assert EPISODE_LENGTH_S == pytest.approx(DANCE_PERIOD_S)
 
 
 def test_episode_stays_short():
     """The routine must not grow into a 9 s sit: the previous long version spent
     most of its budget on the walk and failed at the repetition handover."""
-    assert EPISODE_LENGTH_S <= 6.5
+    assert EPISODE_LENGTH_S <= 7.0
 
 
 def test_walk_half_is_specified_by_distance_not_by_step_count():
@@ -212,6 +244,7 @@ def test_sway_tracking_is_maximal_when_the_lean_matches_the_reference():
         env,
         command_name="twist",
         n_reps=N_REPS,
+        rep_end=REP_END,
         walk_end=WALK_END,
         n_sways=N_SWAYS,
         amplitude=DANCE_SWAY_AMPLITUDE,
@@ -229,6 +262,7 @@ def test_sway_tracking_does_not_pay_full_marks_for_standing_level():
         env,
         command_name="twist",
         n_reps=N_REPS,
+        rep_end=REP_END,
         walk_end=WALK_END,
         n_sways=N_SWAYS,
         amplitude=DANCE_SWAY_AMPLITUDE,
@@ -244,6 +278,7 @@ def test_sway_l1_charges_the_lean_error_in_radians():
         env,
         command_name="twist",
         n_reps=N_REPS,
+        rep_end=REP_END,
         walk_end=WALK_END,
         n_sways=N_SWAYS,
         amplitude=DANCE_SWAY_AMPLITUDE,
@@ -258,6 +293,7 @@ def test_sway_l1_charges_the_lean_error_in_radians():
         matching,
         command_name="twist",
         n_reps=N_REPS,
+        rep_end=REP_END,
         walk_end=WALK_END,
         n_sways=N_SWAYS,
         amplitude=DANCE_SWAY_AMPLITUDE,
@@ -271,14 +307,18 @@ def _step(env):
         command_name="twist",
         sensor_name="feet_ground_contact",
         n_reps=N_REPS,
+        rep_end=REP_END,
         walk_end=WALK_END,
         n_steps=N_STEPS,
         n_sways=N_SWAYS,
+        amplitude=DANCE_SWAY_AMPLITUDE,
+        lean_frac=DANCE_LEAN_FRAC,
     ).item()
 
 
 def test_step_tracking_needs_the_schedule_and_the_lift():
-    # RIGHT scheduled and RIGHT airborne -> paid
+    # In the WALK half the lean test is vacuous (reference 0), so a scheduled
+    # airborne foot is simply a step.
     env = _dance_env(0.0, air_time=torch.tensor([[0.0, 0.2]]))
     assert _step(env) == pytest.approx(1.0)
     # ... and the WRONG foot being up is not a step either
@@ -286,12 +326,24 @@ def test_step_tracking_needs_the_schedule_and_the_lift():
     assert _step(wrong) == 0.0
 
 
-def test_step_tracking_also_runs_in_the_sway_half():
-    """The sway's lean needs its paired lift, so the step term must not switch
-    off after the walk."""
+def test_sway_half_lift_only_pays_while_leaning():
+    """The sway half's lift is the counterweight to the lean. Measured: without
+    this condition the policy twisted its hips to lift the feet with a level
+    trunk, collecting the lift rewards and drifting 80 deg of yaw."""
     left_peak = _sway_local(1.0 / (4 * N_SWAYS))  # leaning left, right foot up
-    env = _dance_env(left_peak, air_time=torch.tensor([[0.0, 0.2]]))
-    assert _step(env) == pytest.approx(1.0)
+    air = torch.tensor([[0.0, 0.2]])
+    # leaning the full reference: paid
+    leaning = _dance_env(left_peak, gravity=_lean(DANCE_SWAY_AMPLITUDE), air_time=air)
+    assert _step(leaning) == pytest.approx(1.0)
+    # leaning only a token amount (< lean_frac of the reference): not paid
+    token = _dance_env(left_peak, gravity=_lean(0.2 * DANCE_SWAY_AMPLITUDE), air_time=air)
+    assert _step(token) == 0.0
+    # level trunk (the strategy that was actually learned): not paid
+    level = _dance_env(left_peak, air_time=air)
+    assert _step(level) == 0.0
+    # leaning the WRONG way: not paid
+    wrong_way = _dance_env(left_peak, gravity=_lean(-DANCE_SWAY_AMPLITUDE), air_time=air)
+    assert _step(wrong_way) == 0.0
 
 
 def _progress_env(local):
@@ -305,8 +357,8 @@ def _progress_env(local):
 
 def _progress(env):
     return microduck_mdp.dance_forward_progress(
-        env, command_name="twist", n_reps=N_REPS, walk_end=WALK_END,
-        target_distance=DANCE_FORWARD_M,
+        env, command_name="twist", n_reps=N_REPS, rep_end=REP_END,
+        walk_end=WALK_END, target_distance=DANCE_FORWARD_M,
     )
 
 
@@ -333,8 +385,8 @@ def test_forward_progress_is_capped_at_the_target_distance():
     assert _progress(env).item() == pytest.approx(0.0, abs=1e-9)
 
 
-def test_forward_progress_is_inactive_during_the_stand_window():
-    env = _progress_env(WALK_END + 0.1)
+def test_forward_progress_is_inactive_during_the_closing_stand():
+    env = _progress_env(1.0)  # local phase in the stand tail
     env.scene["robot"].data.root_link_pos_w[0, 0] = 0.05
     assert _progress(env).item() == 0.0
 

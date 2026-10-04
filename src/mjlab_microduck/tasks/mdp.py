@@ -5073,9 +5073,20 @@ def dance_phase(command: torch.Tensor) -> torch.Tensor:
     return torch.atan2(command[:, 1], command[:, 0]) / (2.0 * math.pi) % 1.0
 
 
-def dance_local_phase(command: torch.Tensor, n_reps: int) -> torch.Tensor:
-    """Local phase in [0, 1) inside the repetition currently being played."""
-    return (dance_phase(command) * n_reps) % 1.0
+def dance_local_phase(
+    command: torch.Tensor, n_reps: int, rep_end: float
+) -> torch.Tensor:
+    """Per-repetition phase in [0, 1), and exactly 1.0 during the closing stand.
+
+    The N_REPS repetitions occupy [0, rep_end) of the period and everything after
+    that is the stand the routine ends on. Returning 1.0 there closes every
+    window test at once — walk, sway and foot lifts all stop — so the stand needs
+    no terms of its own: the sway reference is level, the feet stay planted, and
+    the posture / pitch / heading terms already hold it.
+    """
+    u = torch.clamp(dance_phase(command) / rep_end, max=1.0)
+    local = (u * n_reps) % 1.0
+    return torch.where(u >= 1.0, torch.ones_like(local), local)
 
 
 def _dance_command(env: ManagerBasedRlEnv, command_name: str) -> torch.Tensor:
@@ -5166,7 +5177,7 @@ def dance_sway_reference(
 
     The sway starts and ends at 0, so the hand-overs into and out of it are level.
     """
-    in_sway = (local >= walk_end).to(torch.float32)
+    in_sway = ((local >= walk_end) & (local < 1.0)).to(torch.float32)
     t = (local - walk_end) / (1.0 - walk_end)
     return amplitude * torch.sin(2.0 * math.pi * n_sways * t) * in_sway
 
@@ -5190,8 +5201,9 @@ def dance_step_schedule(
     walk_phase = local / walk_end * n_steps
     sway_phase = (local - walk_end) / (1.0 - walk_end) * n_sways
     phase = torch.where(in_walk, walk_phase, sway_phase) % 1.0
-    right_up = (phase < 0.5).to(torch.float32)
-    left_up = 1.0 - right_up
+    lifted = (local < 1.0).to(torch.float32)  # the closing stand: feet planted
+    right_up = (phase < 0.5).to(torch.float32) * lifted
+    left_up = (1.0 - (phase < 0.5).to(torch.float32)) * lifted
     return torch.stack((left_up, right_up), dim=-1)
 
 
@@ -5202,6 +5214,7 @@ def dance_sway_tracking(
     env: ManagerBasedRlEnv,
     command_name: str,
     n_reps: int,
+    rep_end: float,
     walk_end: float,
     n_sways: int,
     amplitude: float,
@@ -5216,7 +5229,7 @@ def dance_sway_tracking(
     doubles as a "keep the trunk level" term over the rest of the routine.
     """
     asset: Entity = env.scene[asset_cfg.name]
-    local = dance_local_phase(_dance_command(env, command_name), n_reps)
+    local = dance_local_phase(_dance_command(env, command_name), n_reps, rep_end)
     reference = dance_sway_reference(local, walk_end, n_sways, amplitude)
     return torch.exp(-(((_dance_trunk_roll(asset) - reference) / std) ** 2))
 
@@ -5225,6 +5238,7 @@ def dance_sway_l1(
     env: ManagerBasedRlEnv,
     command_name: str,
     n_reps: int,
+    rep_end: float,
     walk_end: float,
     n_sways: int,
     amplitude: float,
@@ -5238,9 +5252,9 @@ def dance_sway_l1(
     terminate early.
     """
     asset: Entity = env.scene[asset_cfg.name]
-    local = dance_local_phase(_dance_command(env, command_name), n_reps)
+    local = dance_local_phase(_dance_command(env, command_name), n_reps, rep_end)
     reference = dance_sway_reference(local, walk_end, n_sways, amplitude)
-    in_sway = (local >= walk_end).to(torch.float32)
+    in_sway = ((local >= walk_end) & (local < 1.0)).to(torch.float32)
     return -(_dance_trunk_roll(asset) - reference).abs() * in_sway
 
 
@@ -5249,9 +5263,13 @@ def dance_step_tracking(
     command_name: str,
     sensor_name: str,
     n_reps: int,
+    rep_end: float,
     walk_end: float,
     n_steps: int,
     n_sways: int,
+    amplitude: float,
+    lean_frac: float = 0.3,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
     """The scheduled foot is the one OFF the ground; the other is not graded.
 
@@ -5260,8 +5278,17 @@ def dance_step_tracking(
     `foot_swing_height` shape how high it gets, but neither of them knows WHICH
     foot or WHEN. In the sway half this term is also what pairs the lean with the
     lift: leaning LEFT is scheduled at the same phase as the RIGHT foot being up.
+
+    The lift only pays while the trunk is actually leaning the way that phase
+    asks, at least ``lean_frac`` of the way there. Without that condition the
+    policy lifts the feet by twisting the hips instead — a 1000-iteration run
+    measured the hips pinned at their HOME +/-5 deg, the trunk at +/-2 deg
+    against a +/-15 deg reference, both lift rewards collected anyway, and 80 deg
+    of yaw drift from the twisting. The gate is scale-free and vanishes in the
+    walk half, where the reference is 0 and the test is vacuously true.
     """
-    local = dance_local_phase(_dance_command(env, command_name), n_reps)
+    asset: Entity = env.scene[asset_cfg.name]
+    local = dance_local_phase(_dance_command(env, command_name), n_reps, rep_end)
     schedule = dance_step_schedule(local, walk_end, n_steps, n_sways)
     air_time = env.scene[sensor_name].data.current_air_time
     assert air_time is not None, f"Sensor '{sensor_name}' has no air-time field."
@@ -5272,13 +5299,17 @@ def dance_step_tracking(
         ),
         dim=-1,
     )
-    return (schedule * airborne).sum(dim=-1)
+    reference = dance_sway_reference(local, walk_end, n_sways, amplitude)
+    roll = _dance_trunk_roll(asset)
+    leaning = (roll * reference >= lean_frac * reference ** 2).to(torch.float32).unsqueeze(-1)
+    return (schedule * airborne * leaning).sum(dim=-1)
 
 
 def dance_forward_progress(
     env: ManagerBasedRlEnv,
     command_name: str,
     n_reps: int,
+    rep_end: float,
     walk_end: float,
     target_distance: float,
     max_paid_rate: float = 0.5,
@@ -5305,7 +5336,7 @@ def dance_forward_progress(
     ``weight / step_dt`` per episode.
     """
     asset: Entity = env.scene[asset_cfg.name]
-    local = dance_local_phase(_dance_command(env, command_name), n_reps)
+    local = dance_local_phase(_dance_command(env, command_name), n_reps, rep_end)
 
     frontier = torch.maximum(env._dance_fwd_max, _dance_forward_offset(env, asset))
     frontier = torch.clamp(frontier, max=target_distance)
@@ -5382,6 +5413,7 @@ def dance_metric_sway_amp_deg(
     env: ManagerBasedRlEnv,
     command_name: str,
     n_reps: int,
+    rep_end: float,
     walk_end: float,
     n_sways: int,
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
@@ -5393,10 +5425,10 @@ def dance_metric_sway_amp_deg(
     which a single outlier cannot set.
     """
     asset: Entity = env.scene[asset_cfg.name]
-    local = dance_local_phase(_dance_command(env, command_name), n_reps)
+    local = dance_local_phase(_dance_command(env, command_name), n_reps, rep_end)
     t = (local - walk_end) / (1.0 - walk_end)
     shape = torch.sin(2.0 * math.pi * n_sways * t)
-    in_sway = (local >= walk_end).to(torch.float32)
+    in_sway = ((local >= walk_end) & (local < 1.0)).to(torch.float32)
     return 2.0 * _dance_trunk_roll(asset) * shape * in_sway * _DEG
 
 
