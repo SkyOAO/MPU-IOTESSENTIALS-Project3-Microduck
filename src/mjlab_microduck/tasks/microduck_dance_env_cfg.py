@@ -1,4 +1,4 @@
-"""Microduck dance routine — walk three steps, stand, squat three times (×2).
+"""Microduck dance routine — walk a set distance, then sway on the spot (x2).
 
 Episodic phase policy replacing the in-place bounce (2026-10-03: the bounce
 itself tracked well, but a move whose feet are mostly airborne cannot hold a
@@ -6,21 +6,35 @@ heading — it drifted ~0.9 m per 5 s episode). The routine walks instead, so th
 feet have traction and the heading is controllable:
 
     one period (``DANCE_PERIOD_S``) = N_REPS repetitions, each split into
-      ℓ ∈ [0, WALK_END)            walk forward N_STEPS exaggerated steps
-      ℓ ∈ [WALK_END, SQUAT_START)  stand still
-      ℓ ∈ [SQUAT_START, 1.0)       N_SQUATS quick shallow squats
+      [0, WALK_END)      walk forward DANCE_FORWARD_M at N_STEPS steps
+      [WALK_END, 1.0)    N_SWAYS left-right sways on the spot
 
-The walk keeps the bounce's look: the trunk sways with the step rhythm (one lean
-per step, ~15° — ``DANCE_SWAY_DEG``) and the right foot lifts while the trunk
-leans left. ``dance_sway_tracking`` + ``dance_step_tracking`` shape that;
-``dance_forward_progress`` pays only for new forward ground (potential-based, so
-marching in place pays nothing) and ``dance_heading_l1`` keeps the three steps
-straight. ``dance_squat_tracking`` anchors the trunk height from the moment the
-robot is asked to settle and drives the three 1.5 cm dips.
+Walk half: specified by DISTANCE (15 cm), not by a step count. The feet alternate
+at ``N_STEPS`` over the window and each lift must clear ``DANCE_STEP_LIFT_M`` or
+it does not count as a step — "airborne" alone pays the same for a 1 mm scuff and
+a 20 mm step, and a 1000-iteration run converged to 5 mm shuffling with it.
+``dance_forward_progress`` pays new forward ground (potential-based, so marching
+in place pays nothing) and ``dance_heading_l1`` keeps the run straight. The trunk
+is deliberately free in this half: a normal step needs a lateral weight shift.
 
-Phase travels in the twist slot as ``[cos(2πφ), sin(2πφ), 0]`` — the runtime
-one-shot contract — so `GroundPickPhaseCommand` is reused unchanged. Read
-``Episode_Metrics/dance_*`` before touching a reward.
+Sway half: the look signed off earlier — the trunk leans ``DANCE_SWAY_DEG`` while
+the OTHER foot is airborne (``dance_step_schedule`` keeps alternating through this
+half too), so the weight has somewhere to go. That pairing is the whole reason the
+sway works: with both feet planted the robot settles at 0.4 deg of lean and simply
+stands, measured. ``dance_sway_tracking`` + ``dance_sway_l1`` score it, and both
+are gated to this half so they never fight the walk.
+
+The remaining terms are containment: ``dance_feet_level_l1`` (square stance after
+the walk), ``dance_pitch_balance`` and ``dance_head_hold``.
+
+The squats this routine originally ended with were dropped (2026-10-04): with a
+25 mm dip on a 0.45 s cycle the height term's Gaussian is already saturated ~20 mm
+away from the target, so it gives no gradient, and neither the dip reward nor any
+amount of training ever moved the trunk off its standing height.
+
+Phase travels in the twist slot over the unit circle (``[cos, sin, 0]``) — the
+runtime one-shot contract — so `GroundPickPhaseCommand` is reused unchanged.
+Read ``Episode_Metrics/dance_*`` before touching a reward.
 """
 
 import math
@@ -87,35 +101,47 @@ BASE_ORIENTATION_MAX_PITCH_DEG = 10.0  # ±10° forward/backward tilt at episode
 BASE_ORIENTATION_MAX_ROLL_DEG = 5.0  # ±5° side-to-side tilt at episode start
 
 # Routine timing. One period is one full routine (both repetitions) and the
-# episode is exactly one period, so the phase starts and ends at φ = 0 (the
+# episode is exactly one period, so the phase starts and ends at 0 (the
 # standing hand-over the runtime button presses give).
+#
+# Each repetition is two SEPARATE halves: walk forward a set distance, then sway
+# left-right on the spot. Running them at the same time (one lean per step, which
+# an earlier version did) reads as a shuffling walk instead of a sway, and makes
+# the lean compete with the step for balance.
 N_REPS = 2
-DANCE_PERIOD_S = 7.0
-EPISODE_LENGTH_S = DANCE_PERIOD_S              # 350 steps @ 50 Hz
-# 3.5 s per repetition: walk 1.5 s (3 steps @ 0.5 s), stand 0.5 s, squat 1.5 s
-# (3 dips @ 0.5 s) — the "under two seconds" the quick squats were asked to fit.
-WALK_END = 1.5 / (DANCE_PERIOD_S / N_REPS)
-SQUAT_START = 2.0 / (DANCE_PERIOD_S / N_REPS)
+WALK_S = 1.5      # 3 steps at 0.5 s — a normal walking cadence
+SWAY_S = 1.5      # 3 left-right cycles at 0.5 s — the cadence of the sway that
+                  # was signed off (lean per half-cycle, foot lifting with it)
+DANCE_PERIOD_S = N_REPS * (WALK_S + SWAY_S)    # 6.0 s
+EPISODE_LENGTH_S = DANCE_PERIOD_S              # 300 steps @ 50 Hz
+WALK_END = WALK_S / (WALK_S + SWAY_S)
 N_STEPS = 3
-N_SQUATS = 3
+N_SWAYS = 3
 
-# Sway amplitude at each step's mid-stance. 12° was the minimum that unloads the
-# other foot on the bounce; the walk is asked for the same look but exaggerated
-# (15°), which the walk's ground contact can now afford.
+# How far the scheduled foot must clear the floor to count as a step, not a
+# shuffle. "Airborne" alone pays the same for 1 mm as for 20 mm, and a
+# 1000-iteration run converged to 5 mm scuffs with it.
+DANCE_STEP_LIFT_M = 0.015
+
+# Reverse-curriculum spawn mix: the fraction of episodes that start at phase 0,
+# the real deployment hand-over. The rest start anywhere in the routine, so the
+# second repetition gets on-policy data on its own instead of only when the
+# policy survives the walk that precedes it.
+DANCE_START_PHASE_PROB = 0.35
+
+# Sway amplitude at each lean's peak. 12° was the minimum that unloads the other
+# foot on the bounce; the dance is asked for the same look but exaggerated.
 DANCE_SWAY_DEG = 15.0
 DANCE_SWAY_AMPLITUDE = math.radians(DANCE_SWAY_DEG)
 
-# Trunk height (m) at the stand, measured in sim under a standing policy, and
-# the squat dip below it. The dip is deliberately small — the point is that the
-# squat is *visible*, not that it is deep; 15 mm is roughly a knee+0.5 rad squat.
-DANCE_STAND_Z = 0.114
-DANCE_SQUAT_DEPTH = 0.015
+# Fore/aft foot stagger the "stand square" term charges in full (metres).
+DANCE_FEET_LEVEL_SCALE = 0.02
 
-# Forward budget for the whole routine (both repetitions), measured on the
-# walking policy in the CPU/BAM rehearsal: ~10 cm per three-step walk at the
-# speed the robot can actually reach. Paid as potential-based progress, so this
-# is a distance the policy must cover, not a per-step rate it can farm.
-DANCE_FORWARD_M = 0.22
+# How far the walk half must carry the robot. This is the spec — the step count
+# above only sets the cadence it is covered at. Paid as potential-based progress,
+# so it is a distance the policy must cover, not a per-step rate it can farm.
+# 15 cm is what the walking policy in the CPU/BAM rehearsal reaches in ~2 s.
+DANCE_FORWARD_M = 0.15
 
 import mujoco as _mujoco
 import mjlab.terrains as terrain_gen
@@ -241,8 +267,11 @@ def make_microduck_dance_env_cfg(
         r".*hip_yaw.*": 0.3,
         r".*hip_roll.*": 0.05,  # 0.1→0.06→0.05 — hold the 5°-inward stance, stop the leg splay to vertical
         r".*hip_pitch.*": 0.4,
-        r".*knee.*": 0.4,
-        r".*ankle.*": 0.25, # was 0.15
+        # Knee/ankle are looser than the walking recipe (0.4 / 0.25): this gait
+        # lifts the feet high and the tighter tolerance charged the step for
+        # posing the legs the way the task asks.
+        r".*knee.*": 0.6,
+        r".*ankle.*": 0.4,
     }
 
     site_names = ["left_foot", "right_foot"]
@@ -342,86 +371,81 @@ def make_microduck_dance_env_cfg(
         params={"sensor_name": self_collision_cfg.name},
     )
 
-    # --- The walk: sway, three steps, forward ---------------------------------
+    # --- The routine: walk a set distance, then sway on the spot ---------------
     # Every term below is phase-referenced, so none of them can be farmed by
-    # standing still and none of them keeps paying during the stand/squat windows.
+    # standing still, and each half only pays inside its own window.
     dance_cmd = {"command_name": "twist", "n_reps": N_REPS}
     walk_params = {**dance_cmd, "walk_end": WALK_END}
-    sway_params = {**walk_params, "n_steps": N_STEPS}
+    sway_params = {**walk_params, "n_sways": N_SWAYS}
+    step_params = {**sway_params, "n_steps": N_STEPS}
 
+    # The sway half (the bounce's look; both terms score only in this half). The
+    # Gaussian is the look, the L1 is the gradient: at 15° of lean the Gaussian
+    # has already saturated, so on its own it pays most of its maximum for NOT
+    # leaning.
     cfg.rewards["dance_sway_tracking"] = RewardTermCfg(
         func=microduck_mdp.dance_sway_tracking,
         weight=5.0,
         params={**sway_params, "amplitude": DANCE_SWAY_AMPLITUDE, "std": 0.10},
     )
-
-    # L1 bootstrap on the same error (≤ 0 → POSITIVE weight): at the sway peaks
-    # the Gaussian is nearly flat, so the first cycle needs a linear term.
     cfg.rewards["dance_sway_l1"] = RewardTermCfg(
         func=microduck_mdp.dance_sway_l1,
         weight=0.6,
         params={**sway_params, "amplitude": DANCE_SWAY_AMPLITUDE},
     )
 
-    # Phase-gated replacement for the stock `air_time` (see the mdp docstring).
+    # Which foot is up, for the whole routine: a step in the walk half, the
+    # counterweight to the lean in the sway half. Paying only when it also clears
+    # DANCE_STEP_LIFT_M is what turns the shuffle back into steps.
     cfg.rewards["dance_step_tracking"] = RewardTermCfg(
         func=microduck_mdp.dance_step_tracking,
         weight=3.0,
-        params={**sway_params, "sensor_name": feet_ground_cfg.name},
+        params={
+            **step_params,
+            "sensor_name": feet_ground_cfg.name,
+            "height_sensor_name": foot_height_scan_cfg.name,
+            "min_lift": DANCE_STEP_LIFT_M,
+        },
     )
 
     cfg.rewards["dance_forward_progress"] = RewardTermCfg(
         func=microduck_mdp.dance_forward_progress,
-        weight=4.0,
+        weight=0.0,  # final 4.0, ramped by the forward_progress_weight curriculum
         params={**walk_params, "target_distance": DANCE_FORWARD_M},
     )
 
-    # The walker drifts 6–8°/s open loop, so three steps would visibly turn the
-    # robot and the second repetition would start crooked (≤ 0 → POSITIVE weight).
+    # The walker drifts 6–8°/s open loop, so a walk would visibly turn the robot
+    # and the second repetition would start crooked (≤ 0 → POSITIVE weight).
     cfg.rewards["dance_heading_l1"] = RewardTermCfg(
         func=microduck_mdp.dance_heading_l1,
         weight=1.0,
         params=walk_params,
     )
 
-    # --- The stand and the quick squats ---------------------------------------
-    squat_params = {
-        **dance_cmd,
-        "squat_start": SQUAT_START,
-        "n_squats": N_SQUATS,
-        "stand_z": DANCE_STAND_Z,
-        "depth": DANCE_SQUAT_DEPTH,
-    }
-
-    cfg.rewards["dance_squat_tracking"] = RewardTermCfg(
-        func=microduck_mdp.dance_squat_tracking,
-        weight=4.0,
-        params={**squat_params, "walk_end": WALK_END, "std": 0.015},
-    )
-
-    # L1 companion (≤ 0 → POSITIVE weight), normalised by the depth so it stays
-    # O(1): the Gaussian alone is flat until the policy has found the dip.
-    cfg.rewards["dance_squat_l1"] = RewardTermCfg(
-        func=microduck_mdp.dance_squat_l1,
-        weight=0.5,
-        params={**squat_params, "walk_end": WALK_END},
-    )
-
-    # "站稳后脚不要前后岔开" (≤ 0 → POSITIVE weight). Lateral stance is not
-    # priced: feet apart is wanted, and the gait already lands them ~84 mm apart.
+    # --- Containment ----------------------------------------------------------
+    # The stance must come out square after the walk (≤ 0 → POSITIVE weight).
+    # Lateral stance is not priced: feet apart is wanted, and the gait already
+    # lands them ~84 mm apart.
     cfg.rewards["dance_feet_level_l1"] = RewardTermCfg(
         func=microduck_mdp.dance_feet_level_l1,
         weight=1.0,
-        params={**walk_params, "feet_cfg": SceneEntityCfg("robot", site_names=site_names)},
+        params={
+            **walk_params,
+            "feet_cfg": SceneEntityCfg("robot", site_names=site_names),
+            "scale": DANCE_FEET_LEVEL_SCALE,
+        },
     )
 
     # Balance = pitch only. The stock `upright` penalises roll too, and roll is
     # what the sway is asked to produce, so it is replaced rather than tuned.
+    # Held at 4.0 / 0.10 (the walking recipe uses 2.0 / 0.15): fore/aft is the
+    # axis this robot actually falls on, and the tighter term is what carried the
+    # 6000-iteration run to full-length episodes.
     cfg.rewards.pop("upright", None)
     cfg.rewards["dance_pitch_balance"] = RewardTermCfg(
         func=microduck_mdp.dance_pitch_balance,
-        weight=2.0,
-        params={"std": 0.15},
+        weight=4.0,
+        params={"std": 0.10},
     )
 
     # One head term instead of four. The head must not flail (it is 38 % of the
@@ -439,17 +463,17 @@ def make_microduck_dance_env_cfg(
     cfg.rewards.pop("track_linear_velocity", None)
     cfg.rewards.pop("track_angular_velocity", None)
 
-    # `pose` is the leg-posture anchor that stops the splayed-leg freeze. It
-    # mildly opposes the squat's knee bend, but the height terms outbid it.
+    # `pose` is the leg-posture anchor that stops the splayed-leg freeze; see
+    # std_walking above for why its knee/ankle tolerances are widened.
     cfg.rewards["pose"].weight = 2.0
 
     # `air_time` is gone: dance_step_tracking is its phase-gated replacement.
     del cfg.rewards["air_time"]
 
     # Foot shaping for the exaggerated steps. These three all scale with the
-    # foot's own velocity, so they are inert while the robot stands and squats —
-    # only their `command_threshold` gate is meaningless here (the twist slot is
-    # a unit-circle phase), so it is simply left low enough to stay armed.
+    # foot's own velocity, so they are inert while the robot stands — only their
+    # `command_threshold` gate is meaningless here (the twist slot is a
+    # unit-circle phase), so it is simply left low enough to stay armed.
     cfg.rewards["foot_clearance"].params["target_height"] = 0.03
     cfg.rewards["foot_swing_height"].params["target_height"] = 0.03
     for _term in ("foot_clearance", "foot_swing_height", "foot_slip"):
@@ -473,11 +497,6 @@ def make_microduck_dance_env_cfg(
     cfg.metrics["dance_sway_amp_deg"] = MetricsTermCfg(
         func=microduck_mdp.dance_metric_sway_amp_deg,
         params=sway_params,
-        reduce="mean",
-    )
-    cfg.metrics["dance_height_err_mm"] = MetricsTermCfg(
-        func=microduck_mdp.dance_metric_height_err_mm,
-        params=squat_params,
         reduce="mean",
     )
     cfg.metrics["dance_forward_m"] = MetricsTermCfg(
@@ -774,9 +793,9 @@ def make_microduck_dance_env_cfg(
         cfg.events.pop("encoder_bias", None)
 
     # Replace the base velocity command with the routine phase. The twist slot
-    # stays 3D but now carries the runtime one-shot contract
-    # [cos(2πφ), sin(2πφ), 0]; φ = 0 is the standing hand-over point, which is
-    # where the routine starts walking.
+    # stays 3D but now carries the runtime one-shot contract over the unit
+    # circle; phase 0 is the standing hand-over point, which is where the routine
+    # starts walking.
     command = deepcopy(cfg.commands["twist"])
     command.rel_standing_envs = 0.0
     command.rel_heading_envs = 0.0
@@ -789,9 +808,12 @@ def make_microduck_dance_env_cfg(
             **command_kwargs,
             "class_type": microduck_mdp.GroundPickPhaseCommand,
             "period": DANCE_PERIOD_S,
-            # Deployment starts at φ = 0 (standing) and the phase then runs on
-            # its own clock, so every episode must start there too.
-            "randomize_phase": False,
+            # Deployment starts at phase 0 (standing) and the phase then runs on
+            # its own clock, so that slice keeps starting there. The rest are
+            # scattered anywhere in the routine, because the policy otherwise
+            # only practices its second repetition by surviving the first one.
+            "randomize_phase": True,
+            "zero_phase_prob": DANCE_START_PHASE_PROB,
         }
     )
 
@@ -850,6 +872,27 @@ def make_microduck_dance_env_cfg(
                 {"step": 0,          "weight": -0.08},
                 {"step": 500 * 24,   "weight": -0.12},
                 {"step": 1500 * 24,  "weight": -0.15},
+            ],
+        },
+    )
+
+    # Forward progress is introduced in stages, NOT from step 0. A headless
+    # rollout of a 250-iteration run showed 90% of robots falling on the second
+    # step with no episode surviving the walk window: pulled forward while it can
+    # barely balance, the policy never gets far enough to learn. (The previous
+    # run "survived" only because the forward term was effectively worth nothing
+    # - its reward mass was 0.003 against the sway's 3.1 - so it learned a stable
+    # march in place.) Stage 0 is zero: build the stepping and sway first, then
+    # add translation once there is something to push from.
+    cfg.curriculum["forward_progress_weight"] = CurriculumTermCfg(
+        func=microduck_mdp.reward_weight,
+        params={
+            "reward_name": "dance_forward_progress",
+            "weight_stages": [
+                {"step": 0,          "weight": 0.0},
+                {"step": 600 * 24,   "weight": 1.0},
+                {"step": 1200 * 24,  "weight": 2.5},
+                {"step": 2000 * 24,  "weight": 4.0},
             ],
         },
     )
