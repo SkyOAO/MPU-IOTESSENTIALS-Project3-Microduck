@@ -14,16 +14,13 @@ import types
 import pytest
 import torch
 
-from mjlab.managers.scene_entity_config import SceneEntityCfg
 from mjlab_microduck.tasks import mdp as microduck_mdp
 from mjlab_microduck.tasks.microduck_dance_env_cfg import (
-    DANCE_FEET_LEVEL_SCALE,
     DANCE_FORWARD_M,
     DANCE_PERIOD_S,
     DANCE_START_PHASE_PROB,
     DANCE_SWAY_AMPLITUDE,
     DANCE_SWAY_DEG,
-    DANCE_STEP_LIFT_M,
     EPISODE_LENGTH_S,
     N_REPS,
     N_STEPS,
@@ -33,7 +30,6 @@ from mjlab_microduck.tasks.microduck_dance_env_cfg import (
     make_microduck_dance_env_cfg,
 )
 
-FEET_CFG = SceneEntityCfg("robot", site_ids=[0, 1])
 
 
 def _cmd(phases):
@@ -67,7 +63,7 @@ def test_repetition_is_walk_then_sway():
     assert 0.0 < WALK_END < 1.0
     rep = DANCE_PERIOD_S / N_REPS
     assert WALK_END * rep == pytest.approx(1.5, abs=1e-9)          # 3 steps at 0.5 s
-    assert (1.0 - WALK_END) * rep == pytest.approx(1.5, abs=1e-9)  # 2 sways at 0.75 s
+    assert (1.0 - WALK_END) * rep == pytest.approx(1.5, abs=1e-9)  # 3 sways at 0.5 s
     assert EPISODE_LENGTH_S == pytest.approx(N_REPS * rep)
 
 
@@ -274,30 +270,19 @@ def _step(env):
         env,
         command_name="twist",
         sensor_name="feet_ground_contact",
-        height_sensor_name="foot_height_scan",
         n_reps=N_REPS,
         walk_end=WALK_END,
         n_steps=N_STEPS,
         n_sways=N_SWAYS,
-        min_lift=DANCE_STEP_LIFT_M,
     ).item()
 
 
-def test_step_tracking_needs_the_schedule_the_lift_and_the_clearance():
-    # RIGHT scheduled, RIGHT airborne and clear -> paid
-    env = _dance_env(
-        0.0, air_time=torch.tensor([[0.0, 0.2]]), heights=torch.tensor([[0.0, 0.02]])
-    )
+def test_step_tracking_needs_the_schedule_and_the_lift():
+    # RIGHT scheduled and RIGHT airborne -> paid
+    env = _dance_env(0.0, air_time=torch.tensor([[0.0, 0.2]]))
     assert _step(env) == pytest.approx(1.0)
-    # ... but a scuff under DANCE_STEP_LIFT_M pays nothing
-    scuff = _dance_env(
-        0.0, air_time=torch.tensor([[0.0, 0.2]]), heights=torch.tensor([[0.0, 0.005]])
-    )
-    assert _step(scuff) == 0.0
     # ... and the WRONG foot being up is not a step either
-    wrong = _dance_env(
-        0.0, air_time=torch.tensor([[0.2, 0.0]]), heights=torch.tensor([[0.02, 0.0]])
-    )
+    wrong = _dance_env(0.0, air_time=torch.tensor([[0.2, 0.0]]))
     assert _step(wrong) == 0.0
 
 
@@ -305,9 +290,7 @@ def test_step_tracking_also_runs_in_the_sway_half():
     """The sway's lean needs its paired lift, so the step term must not switch
     off after the walk."""
     left_peak = _sway_local(1.0 / (4 * N_SWAYS))  # leaning left, right foot up
-    env = _dance_env(
-        left_peak, air_time=torch.tensor([[0.0, 0.2]]), heights=torch.tensor([[0.0, 0.02]])
-    )
+    env = _dance_env(left_peak, air_time=torch.tensor([[0.0, 0.2]]))
     assert _step(env) == pytest.approx(1.0)
 
 
@@ -356,47 +339,6 @@ def test_forward_progress_is_inactive_during_the_stand_window():
     assert _progress(env).item() == 0.0
 
 
-def test_feet_level_penalty_grows_with_the_fore_aft_stagger():
-    sites = torch.zeros(1, 2, 3)
-    sites[0, 0, 0] = 0.02  # left foot 2 cm ahead of the right one
-    env = _dance_env(WALK_END + 0.1, sites=sites)
-    score = microduck_mdp.dance_feet_level_l1(
-        env,
-        command_name="twist",
-        n_reps=N_REPS,
-        walk_end=WALK_END,
-        feet_cfg=FEET_CFG,
-        scale=DANCE_FEET_LEVEL_SCALE,
-    )
-    # Normalised: one DANCE_FEET_LEVEL_SCALE of stagger is worth a full unit.
-    assert score.item() == pytest.approx(-0.02 / DANCE_FEET_LEVEL_SCALE, abs=1e-6)
-
-    sites[0, 0, 0] = 0.0
-    assert microduck_mdp.dance_feet_level_l1(
-        env,
-        command_name="twist",
-        n_reps=N_REPS,
-        walk_end=WALK_END,
-        feet_cfg=FEET_CFG,
-        scale=DANCE_FEET_LEVEL_SCALE,
-    ).item() == pytest.approx(0.0, abs=1e-6)
-
-
-def test_feet_are_not_judged_while_walking():
-    sites = torch.zeros(1, 2, 3)
-    sites[0, 0, 0] = 0.05  # a long stride, which is not a stagger
-    env = _dance_env(0.0, sites=sites)
-    score = microduck_mdp.dance_feet_level_l1(
-        env,
-        command_name="twist",
-        n_reps=N_REPS,
-        walk_end=WALK_END,
-        feet_cfg=FEET_CFG,
-        scale=DANCE_FEET_LEVEL_SCALE,
-    )
-    assert score.item() == 0.0
-
-
 # --------------------------------------------------------------------------- #
 # Cfg invariants                                                               #
 # --------------------------------------------------------------------------- #
@@ -421,7 +363,6 @@ def test_the_routine_terms_are_registered():
         "dance_step_tracking": 3.0,
         "dance_forward_progress": 0.0,  # ramped by the forward_progress_weight curriculum
         "dance_heading_l1": 1.0,
-        "dance_feet_level_l1": 1.0,
         "dance_pitch_balance": 4.0,
         "dance_head_hold": 0.4,
     }
@@ -452,8 +393,9 @@ def test_the_squat_is_gone():
 
 
 def test_the_bounce_terms_are_gone():
-    """The in-place bounce was replaced, not patched: none of its terms may come
-    back, and neither may the stock air-time term it superseded."""
+    """The in-place bounce was replaced, not patched: none of its task terms may
+    come back. The stock `air_time` is NOT in that list — it is the velocity
+    recipe's own gait shaping and the routine keeps it."""
     cfg = make_microduck_dance_env_cfg()
     for name in (
         "bounce_roll_tracking",
@@ -463,9 +405,11 @@ def test_the_bounce_terms_are_gone():
         "bounce_stay_in_place_l1",
         "bounce_pitch_balance",
         "bounce_head_hold",
-        "air_time",
     ):
         assert name not in cfg.rewards, name
+    assert cfg.rewards["air_time"].weight == pytest.approx(3.0)
+    assert cfg.rewards["air_time"].params["threshold_min"] == pytest.approx(0.125)
+    assert cfg.rewards["air_time"].params["threshold_max"] == pytest.approx(0.300)
     for name in (
         "bounce_phase",
         "bounce_roll_reference",
@@ -499,7 +443,7 @@ def test_velocity_tracking_terms_are_removed():
 
 def test_self_negating_terms_keep_a_positive_weight():
     cfg = make_microduck_dance_env_cfg()
-    for name in ("dance_sway_l1", "dance_heading_l1", "dance_feet_level_l1"):
+    for name in ("dance_sway_l1", "dance_heading_l1"):
         assert cfg.rewards[name].weight > 0.0, name
 
 
@@ -522,7 +466,6 @@ def test_diagnostics_are_registered_as_episode_metrics():
         "dance_sway_amp_deg": "mean",
         "dance_forward_m": "last",
         "dance_yaw_drift_deg": "last",
-        "dance_feet_fore_aft_mm": "last",
     }
     for name, reduce in expected.items():
         assert name in cfg.metrics, name

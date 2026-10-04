@@ -9,23 +9,23 @@ feet have traction and the heading is controllable:
       [0, WALK_END)      walk forward DANCE_FORWARD_M at N_STEPS steps
       [WALK_END, 1.0)    N_SWAYS left-right sways on the spot
 
-Walk half: specified by DISTANCE (15 cm), not by a step count. The feet alternate
-at ``N_STEPS`` over the window and each lift must clear ``DANCE_STEP_LIFT_M`` or
-it does not count as a step — "airborne" alone pays the same for a 1 mm scuff and
-a 20 mm step, and a 1000-iteration run converged to 5 mm shuffling with it.
-``dance_forward_progress`` pays new forward ground (potential-based, so marching
-in place pays nothing) and ``dance_heading_l1`` keeps the run straight. The trunk
-is deliberately free in this half: a normal step needs a lateral weight shift.
+Walk half: specified by DISTANCE (15 cm), not by a step count. ``dance_forward_
+progress`` pays new forward ground (potential-based, so marching in place pays
+nothing) and ``dance_heading_l1`` keeps the run straight. The gait itself is the
+velocity recipe's own shaping — ``air_time`` (3.0, 0.125-0.3 s), ``foot_clearance``
+and ``foot_swing_height`` (target 0.02), ``foot_slip`` — plus ``dance_step_tracking``
+for timing, since none of the stock terms knows WHICH foot should be up when.
 
-Sway half: the look signed off earlier — the trunk leans ``DANCE_SWAY_DEG`` while
-the OTHER foot is airborne (``dance_step_schedule`` keeps alternating through this
-half too), so the weight has somewhere to go. That pairing is the whole reason the
-sway works: with both feet planted the robot settles at 0.4 deg of lean and simply
-stands, measured. ``dance_sway_tracking`` + ``dance_sway_l1`` score it, and both
-are gated to this half so they never fight the walk.
+Sway half: the look that was signed off, moved to its own half of the routine and
+otherwise unchanged — ``DANCE_SWAY_DEG`` of trunk lean at ``SWAY_S / N_SWAYS`` per
+left-right cycle, scored by ``dance_sway_tracking`` + ``dance_sway_l1``, with the
+lean paired to the opposite foot being airborne so the weight has somewhere to go
+(``dance_step_schedule`` keeps alternating through this half as well). That pairing
+is why the sway works at all: with both feet planted the robot settles at 0.4 deg
+of lean and simply stands, measured.
 
-The remaining terms are containment: ``dance_feet_level_l1`` (square stance after
-the walk), ``dance_pitch_balance`` and ``dance_head_hold``.
+The remaining terms are containment: ``dance_heading_l1`` (whole routine, the
+bounce's heading pair), ``dance_pitch_balance`` and ``dance_head_hold``.
 
 The squats this routine originally ended with were dropped (2026-10-04): with a
 25 mm dip on a 0.45 s cycle the height term's Gaussian is already saturated ~20 mm
@@ -110,18 +110,13 @@ BASE_ORIENTATION_MAX_ROLL_DEG = 5.0  # ±5° side-to-side tilt at episode start
 # the lean compete with the step for balance.
 N_REPS = 2
 WALK_S = 1.5      # 3 steps at 0.5 s — a normal walking cadence
-SWAY_S = 1.5      # 3 left-right cycles at 0.5 s — the cadence of the sway that
-                  # was signed off (lean per half-cycle, foot lifting with it)
+SWAY_S = 1.5      # 3 left-right cycles at 0.5 s — the sway's own cadence, from
+                  # the version it was signed off in (15 deg, lean per half-cycle)
 DANCE_PERIOD_S = N_REPS * (WALK_S + SWAY_S)    # 6.0 s
 EPISODE_LENGTH_S = DANCE_PERIOD_S              # 300 steps @ 50 Hz
 WALK_END = WALK_S / (WALK_S + SWAY_S)
 N_STEPS = 3
 N_SWAYS = 3
-
-# How far the scheduled foot must clear the floor to count as a step, not a
-# shuffle. "Airborne" alone pays the same for 1 mm as for 20 mm, and a
-# 1000-iteration run converged to 5 mm scuffs with it.
-DANCE_STEP_LIFT_M = 0.015
 
 # Reverse-curriculum spawn mix: the fraction of episodes that start at phase 0,
 # the real deployment hand-over. The rest start anywhere in the routine, so the
@@ -129,13 +124,10 @@ DANCE_STEP_LIFT_M = 0.015
 # policy survives the walk that precedes it.
 DANCE_START_PHASE_PROB = 0.35
 
-# Sway amplitude at each lean's peak. 12° was the minimum that unloads the other
-# foot on the bounce; the dance is asked for the same look but exaggerated.
+# Sway amplitude at each lean's peak, unchanged from the version this look was
+# signed off in.
 DANCE_SWAY_DEG = 15.0
 DANCE_SWAY_AMPLITUDE = math.radians(DANCE_SWAY_DEG)
-
-# Fore/aft foot stagger the "stand square" term charges in full (metres).
-DANCE_FEET_LEVEL_SCALE = 0.02
 
 # How far the walk half must carry the robot. This is the spec — the step count
 # above only sets the cadence it is covered at. Paid as potential-based progress,
@@ -400,12 +392,7 @@ def make_microduck_dance_env_cfg(
     cfg.rewards["dance_step_tracking"] = RewardTermCfg(
         func=microduck_mdp.dance_step_tracking,
         weight=3.0,
-        params={
-            **step_params,
-            "sensor_name": feet_ground_cfg.name,
-            "height_sensor_name": foot_height_scan_cfg.name,
-            "min_lift": DANCE_STEP_LIFT_M,
-        },
+        params={**step_params, "sensor_name": feet_ground_cfg.name},
     )
 
     cfg.rewards["dance_forward_progress"] = RewardTermCfg(
@@ -416,26 +403,15 @@ def make_microduck_dance_env_cfg(
 
     # The walker drifts 6–8°/s open loop, so a walk would visibly turn the robot
     # and the second repetition would start crooked (≤ 0 → POSITIVE weight).
+    # Whole-routine, like the bounce's heading pair: the sway shifts the weight
+    # side to side and turns the robot just as readily as the steps do.
     cfg.rewards["dance_heading_l1"] = RewardTermCfg(
         func=microduck_mdp.dance_heading_l1,
         weight=1.0,
-        params=walk_params,
+        params={"command_name": "twist"},
     )
 
     # --- Containment ----------------------------------------------------------
-    # The stance must come out square after the walk (≤ 0 → POSITIVE weight).
-    # Lateral stance is not priced: feet apart is wanted, and the gait already
-    # lands them ~84 mm apart.
-    cfg.rewards["dance_feet_level_l1"] = RewardTermCfg(
-        func=microduck_mdp.dance_feet_level_l1,
-        weight=1.0,
-        params={
-            **walk_params,
-            "feet_cfg": SceneEntityCfg("robot", site_names=site_names),
-            "scale": DANCE_FEET_LEVEL_SCALE,
-        },
-    )
-
     # Balance = pitch only. The stock `upright` penalises roll too, and roll is
     # what the sway is asked to produce, so it is replaced rather than tuned.
     # Held at 4.0 / 0.10 (the walking recipe uses 2.0 / 0.15): fore/aft is the
@@ -463,21 +439,24 @@ def make_microduck_dance_env_cfg(
     cfg.rewards.pop("track_linear_velocity", None)
     cfg.rewards.pop("track_angular_velocity", None)
 
-    # `pose` is the leg-posture anchor that stops the splayed-leg freeze; see
-    # std_walking above for why its knee/ankle tolerances are widened.
+    # `pose` is the leg-posture anchor that stops the splayed-leg freeze; the
+    # weight is the sway version's own.
     cfg.rewards["pose"].weight = 2.0
 
-    # `air_time` is gone: dance_step_tracking is its phase-gated replacement.
-    del cfg.rewards["air_time"]
-
-    # Foot shaping for the exaggerated steps. These three all scale with the
-    # foot's own velocity, so they are inert while the robot stands — only their
-    # `command_threshold` gate is meaningless here (the twist slot is a
-    # unit-circle phase), so it is simply left low enough to stay armed.
-    cfg.rewards["foot_clearance"].params["target_height"] = 0.03
-    cfg.rewards["foot_swing_height"].params["target_height"] = 0.03
-    for _term in ("foot_clearance", "foot_swing_height", "foot_slip"):
-        cfg.rewards[_term].params["command_threshold"] = 0.1
+    # Gait shaping straight from the velocity recipe, values and all: `air_time`
+    # pays for a foot that stays off the ground 0.125-0.3 s, `foot_clearance` and
+    # `foot_swing_height` shape how high it gets, `foot_slip` damps scraping. An
+    # earlier version deleted `air_time` because its command gate can never close
+    # on a unit-circle phase — that objection does not apply here: the feet are
+    # meant to lift in BOTH halves (they are the steps, and the sway's
+    # counterweight), so an always-armed gate is what we want.
+    cfg.rewards["air_time"].weight = 3.0
+    cfg.rewards["air_time"].params["threshold_min"] = 0.125
+    cfg.rewards["air_time"].params["threshold_max"] = 0.300
+    cfg.rewards["foot_clearance"].params["target_height"] = 0.02
+    cfg.rewards["foot_swing_height"].params["target_height"] = 0.02
+    for _term in ("air_time", "foot_clearance", "foot_swing_height", "foot_slip"):
+        cfg.rewards[_term].params["command_threshold"] = 0.01
     cfg.rewards["foot_slip"].weight = -0.4
 
     # Trunk pitch/roll rate: damps the sway instead of forbidding it. Kept small
@@ -504,11 +483,6 @@ def make_microduck_dance_env_cfg(
     )
     cfg.metrics["dance_yaw_drift_deg"] = MetricsTermCfg(
         func=microduck_mdp.dance_metric_yaw_drift_deg, reduce="last"
-    )
-    cfg.metrics["dance_feet_fore_aft_mm"] = MetricsTermCfg(
-        func=microduck_mdp.dance_metric_feet_fore_aft_mm,
-        params={"feet_cfg": SceneEntityCfg("robot", site_names=site_names)},
-        reduce="last",
     )
 
     # Events
