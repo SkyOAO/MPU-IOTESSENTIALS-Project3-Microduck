@@ -5224,14 +5224,22 @@ def dance_sway_tracking(
     """MAIN sway term: the standing half of the routine leans left and right.
 
     ``exp(-((roll - reference) / std)^2)``, the bounce's own shape and the one
-    the look was tuned on. Deliberately NOT window-gated, matching the version
-    this look was signed off in: outside the sway its reference is 0, so it
-    doubles as a "keep the trunk level" term over the rest of the routine.
+    the look was tuned on, scored in the sway window and nowhere else.
+
+    The window gate is what leaves leaning as the only way to collect this
+    term. Ungated, it also paid out in the walk and closing-stand halves (their
+    reference is 0 and a walking trunk is close to level), which came to ~3.2 of
+    the 5.0 — and paid MORE per step in the walk half than in the sway half. A
+    400-iteration run collected that subsidy: the sway metric stayed at 0.2° and
+    this term was flat from iteration ~150 on, because actually leaning is a
+    single-support move the policy had no reason to risk. Gated, the same
+    behaviour scores ~0.5 and the window prices only the lean.
     """
     asset: Entity = env.scene[asset_cfg.name]
     local = dance_local_phase(_dance_command(env, command_name), n_reps, rep_end)
     reference = dance_sway_reference(local, walk_end, n_sways, amplitude)
-    return torch.exp(-(((_dance_trunk_roll(asset) - reference) / std) ** 2))
+    in_sway = ((local >= walk_end) & (local < 1.0)).to(torch.float32)
+    return torch.exp(-(((_dance_trunk_roll(asset) - reference) / std) ** 2)) * in_sway
 
 
 def dance_sway_l1(

@@ -192,9 +192,11 @@ def test_the_sway_lift_is_paired_with_the_lean():
 # --------------------------------------------------------------------------- #
 # Task terms                                                                   #
 # --------------------------------------------------------------------------- #
-def _dance_env(local, gravity=None, pos=None, sites=None, air_time=None, heights=None):
+def _dance_env(
+    local, gravity=None, pos=None, sites=None, air_time=None, heights=None, command=None
+):
     """Minimal stand-in for a ManagerBasedRlEnv carrying one environment."""
-    command = _local(local)
+    command = _local(local) if command is None else command
     data = types.SimpleNamespace(
         # Default to the upright reading (0, 0, -1): an all-zero gravity vector
         # makes atan2(-0, -0) return -pi and quietly fakes a fallen trunk.
@@ -269,6 +271,27 @@ def test_sway_tracking_does_not_pay_full_marks_for_standing_level():
         std=0.10,
     )
     assert score.item() < 0.05
+
+
+def test_sway_tracking_pays_nothing_outside_the_sway_window():
+    """The look is paid inside the sway window only, so a level trunk cannot farm
+    the walk and closing-stand halves. That subsidy is what a 400-iteration run
+    took instead of leaning (sway metric stuck at 0.2°)."""
+
+    def _score(env):
+        return microduck_mdp.dance_sway_tracking(
+            env,
+            command_name="twist",
+            n_reps=N_REPS,
+            rep_end=REP_END,
+            walk_end=WALK_END,
+            n_sways=N_SWAYS,
+            amplitude=DANCE_SWAY_AMPLITUDE,
+            std=0.10,
+        ).item()
+
+    assert _score(_dance_env(WALK_END * 0.5)) == pytest.approx(0.0)   # mid-walk
+    assert _score(_dance_env(0.0, command=_tail(0.5))) == pytest.approx(0.0)  # stand
 
 
 def test_sway_l1_charges_the_lean_error_in_radians():
@@ -411,7 +434,7 @@ def test_the_routine_terms_are_registered():
     cfg = make_microduck_dance_env_cfg()
     expected = {
         "dance_sway_tracking": 5.0,
-        "dance_sway_l1": 0.6,
+        "dance_sway_l1": 2.0,
         "dance_step_tracking": 3.0,
         "dance_forward_progress": 0.0,  # ramped by the forward_progress_weight curriculum
         "dance_heading_l1": 1.0,

@@ -16,13 +16,15 @@ velocity recipe's own shaping — ``air_time`` (3.0, 0.125-0.3 s), ``foot_cleara
 and ``foot_swing_height`` (target 0.02), ``foot_slip`` — plus ``dance_step_tracking``
 for timing, since none of the stock terms knows WHICH foot should be up when.
 
-Sway half: the look that was signed off, moved to its own half of the routine and
-otherwise unchanged — ``DANCE_SWAY_DEG`` of trunk lean at ``SWAY_S / N_SWAYS`` per
-left-right cycle, scored by ``dance_sway_tracking`` + ``dance_sway_l1``, with the
-lean paired to the opposite foot being airborne so the weight has somewhere to go
-(``dance_step_schedule`` keeps alternating through this half as well). That pairing
-is why the sway works at all: with both feet planted the robot settles at 0.4 deg
-of lean and simply stands, measured.
+Sway half: the look that was signed off — ``DANCE_SWAY_DEG`` of trunk lean at
+``SWAY_S / N_SWAYS`` per left-right cycle, scored by ``dance_sway_tracking`` +
+``dance_sway_l1``, with the lean paired to the opposite foot being airborne so the
+weight has somewhere to go (``dance_step_schedule`` keeps alternating through this
+half as well). That pairing is why the sway works at all: with both feet planted
+the robot settles at 0.4 deg of lean and simply stands, measured. The shape,
+amplitude and cadence are unchanged from the signed-off version; both scoring terms
+are window-gated, because the ungated Gaussian paid more for standing level than
+for leaning (see ``dance_sway_tracking``).
 
 The remaining terms are containment: ``dance_heading_l1`` (whole routine, the
 bounce's heading pair), ``dance_pitch_balance`` and ``dance_head_hold``.
@@ -385,10 +387,13 @@ def make_microduck_dance_env_cfg(
     sway_params = {**walk_params, "n_sways": N_SWAYS}
     step_params = {**sway_params, "n_steps": N_STEPS}
 
-    # The sway half (the bounce's look; both terms score only in this half). The
-    # Gaussian is the look, the L1 is the gradient: at 15° of lean the Gaussian
-    # has already saturated, so on its own it pays most of its maximum for NOT
-    # leaning.
+    # The sway half (the bounce's look; both terms are window-gated, so neither
+    # scores outside it). The Gaussian is the look, the L1 is the gradient: at 15°
+    # of lean the Gaussian has already saturated, so in the window's first
+    # half-cycle it is too flat to move the policy, which is what the L1 is for.
+    # It carries 2.0 rather than the bounce's 0.6 because 0.6/rad was the WHOLE
+    # gradient at the policy's own operating point (roll ~0, where the Gaussian's
+    # slope is only ~0.3/rad) — a 400-iteration run simply sat on that flat spot.
     cfg.rewards["dance_sway_tracking"] = RewardTermCfg(
         func=microduck_mdp.dance_sway_tracking,
         weight=5.0,
@@ -396,7 +401,7 @@ def make_microduck_dance_env_cfg(
     )
     cfg.rewards["dance_sway_l1"] = RewardTermCfg(
         func=microduck_mdp.dance_sway_l1,
-        weight=0.6,
+        weight=2.0,
         params={**sway_params, "amplitude": DANCE_SWAY_AMPLITUDE},
     )
 
