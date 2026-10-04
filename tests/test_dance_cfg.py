@@ -343,25 +343,27 @@ def test_step_tracking_needs_the_schedule_and_the_lift():
     assert _step(wrong) == 0.0
 
 
-def test_the_lift_only_pays_while_leaning_with_the_swing():
-    """The lift and the lean are one motion: the right foot is up exactly while
-    the trunk leans left. Measured: without this condition the policy twisted its
-    hips to lift the feet with a level trunk instead, collecting the lift rewards
-    and drifting 80 deg of yaw."""
-    left_peak = _sway_local(0.25)  # leaning left, right foot up
+def test_the_lift_requires_the_lean_sign_not_a_formed_lean():
+    """The lift is the ladder the gait is learned on, so it must NOT require a
+    formed lean: a foot is only unloaded by leaning over the other one, and a gate
+    that demands both locks them together. Measured at lean_frac 0.3, the trunk
+    never rolled at all for 550 iterations. What it does require is the correct
+    SIGN, so a level shuffle leaning the wrong way is still not paid."""
+    left_peak = _sway_local(0.25)  # the reference leans left here, right foot up
     air = torch.tensor([[0.0, 0.2]])
     # leaning the full reference: paid
     leaning = _dance_env(left_peak, gravity=_lean(DANCE_SWAY_AMPLITUDE), air_time=air)
     assert _step(leaning) == pytest.approx(1.0)
-    # leaning only a token amount (< lean_frac of the reference): not paid
+    # leaning only a token amount: still paid — this is the ladder
     token = _dance_env(left_peak, gravity=_lean(0.2 * DANCE_SWAY_AMPLITUDE), air_time=air)
-    assert _step(token) == 0.0
-    # level trunk (the strategy that was actually learned): not paid
+    assert _step(token) == pytest.approx(1.0)
+    # level trunk: paid, because `roll * ref >= 0` holds at roll = 0
     level = _dance_env(left_peak, air_time=air)
-    assert _step(level) == 0.0
+    assert _step(level) == pytest.approx(1.0)
     # leaning the WRONG way: not paid
     wrong_way = _dance_env(left_peak, gravity=_lean(-DANCE_SWAY_AMPLITUDE), air_time=air)
     assert _step(wrong_way) == 0.0
+    assert DANCE_LEAN_FRAC == pytest.approx(0.0)
 
 
 def _progress_env(local):
@@ -436,7 +438,10 @@ def test_cfg_reuses_the_shared_phase_command():
     # rest are scattered so the last steps get on-policy data of their own.
     assert command.randomize_phase is True
     assert command.zero_phase_prob == pytest.approx(DANCE_START_PHASE_PROB)
-    assert 0.0 < DANCE_START_PHASE_PROB < 1.0
+    # This is the fraction that starts at phase 0, the deployment hand-over, so
+    # it must stay HIGH: lowering it means MORE mid-walk spawns, which turn an
+    # episode into recovery practice and pollute the yaw metric.
+    assert 0.5 <= DANCE_START_PHASE_PROB < 1.0
 
 
 def test_the_routine_terms_are_registered():

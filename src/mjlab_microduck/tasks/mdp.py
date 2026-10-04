@@ -5283,14 +5283,18 @@ def dance_step_tracking(
     and it was therefore free money: a 1000-iteration run kept one foot airborne
     for 89 % of the stand instead of standing on it.
 
-    The lift only pays while the trunk is actually leaning the way that phase
-    asks, at least ``lean_frac`` of the way there. Without that condition the
-    policy lifts the feet by twisting the hips instead — a 1000-iteration run
-    measured the hips pinned at their HOME +/-5 deg, the trunk at +/-2 deg
-    against a +/-15 deg reference, both lift rewards collected anyway, and 80 deg
-    of yaw drift from the twisting. The test is scale-free, so it costs nothing
-    at the zero-crossings between steps, and it is what stops the sway from being
-    farmed by stepping while staying level.
+    The lift only pays while the trunk is leaning the way that phase asks,
+    ``roll * reference >= lean_frac * reference ** 2``. At ``lean_frac`` 0.0 that
+    is a pure SIGN test, and it has to be: a foot is only unloaded by leaning over
+    the other one, so a lift payment that also demands a formed lean locks the two
+    together and neither is ever discovered. Measured at 0.3, ``dance_sway_l1``
+    sat pinned at its no-roll value from iteration 250 to 800 — the trunk never
+    rolled at all. The sign test is still not free: stepping with the trunk
+    leaning the wrong way pays nothing, so the sway cannot be farmed by a level
+    shuffle (a 1000-iteration run at much looser gating did exactly that, twisting
+    its hips +/-17 deg for 80 deg of yaw drift, which is why the magnitude test
+    was added) — it is traded for reachability, and leaning further is what
+    collects the rest of the term.
     """
     asset: Entity = env.scene[asset_cfg.name]
     local = dance_local_phase(_dance_command(env, command_name), rep_end)

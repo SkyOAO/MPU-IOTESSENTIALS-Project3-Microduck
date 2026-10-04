@@ -125,10 +125,13 @@ N_STEPS = 8
 # Reverse-curriculum spawn mix: the fraction of episodes that start at phase 0,
 # the real deployment hand-over. The rest start partway through the walk, so the
 # last steps get on-policy data even while early episodes still end before they
-# reach them. Kept low: a mid-walk spawn drops a standing robot into a phase that
-# asks it to be mid-step, and the measured yaw drift is largely per-episode
-# scatter rather than a fixed gait bias.
-DANCE_START_PHASE_PROB = 0.1
+# reach them. Kept HIGH, not low: this is the probability of starting at phase 0,
+# so lowering it means MORE mid-walk spawns — and a mid-walk spawn drops a
+# standing robot into a phase that asks it to be mid-step, which makes most of
+# that episode recovery rather than routine and mixes the recovery turn into the
+# yaw metric. Survival is ~94 % of the episode now, so the last steps no longer
+# need rescuing.
+DANCE_START_PHASE_PROB = 0.7
 
 # Trunk lean at each swing's peak, unchanged from the version this look was
 # signed off in. One left-right swing per step, so the look and the step rhythm
@@ -137,10 +140,16 @@ DANCE_SWAY_DEG = 15.0
 DANCE_SWAY_AMPLITUDE = math.radians(DANCE_SWAY_DEG)
 
 # How far into the commanded lean a lift has to be before it pays, as a fraction
-# of the reference. 0.3 = the trunk must be at least 30% of the way there while
-# the scheduled foot is up; it costs nothing near the swing's zero crossings,
-# where the reference itself is small.
-DANCE_LEAN_FRAC = 0.3
+# of the reference. 0.0 = only the SIGN has to match (`roll * ref >= 0`), and
+# that sign test is the ladder the whole gait hangs off: a foot can only be
+# unloaded by leaning over the other one, so a lift payment that ALSO demands a
+# formed lean locks the two together and neither is ever discovered. At 0.3 that
+# is exactly what happened — a run measured `dance_sway_l1` pinned at its no-roll
+# value (10.0 deg of mean tracking error) from iteration 250 to 800, i.e. the
+# trunk never rolled once. At 0.0 a level but noisy trunk collects about half and
+# a correctly-leaning one collects all, so the lift is teachable first and the
+# lean is still the only way to collect the other half.
+DANCE_LEAN_FRAC = 0.0
 
 # The speed the walk is asked to hold, in m/s. Not a distance: the routine is
 # speed-commanded, so the ground covered is this times WALK_S (0.10 m/s over 4 s
