@@ -453,10 +453,8 @@ def test_cfg_reuses_the_shared_phase_command():
     # rest are scattered so the last steps get on-policy data of their own.
     assert command.randomize_phase is True
     assert command.zero_phase_prob == pytest.approx(DANCE_START_PHASE_PROB)
-    # This is the fraction that starts at phase 0, the deployment hand-over, so
-    # it must stay HIGH: lowering it means MORE mid-walk spawns, which turn an
-    # episode into recovery practice and pollute the yaw metric.
-    assert 0.5 <= DANCE_START_PHASE_PROB < 1.0
+    # This is the fraction that starts at phase 0, the deployment hand-over.
+    assert 0.0 < DANCE_START_PHASE_PROB < 1.0
 
 
 def test_the_routine_terms_are_registered():

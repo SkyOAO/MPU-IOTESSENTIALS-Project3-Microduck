@@ -125,13 +125,10 @@ N_STEPS = 8
 # Reverse-curriculum spawn mix: the fraction of episodes that start at phase 0,
 # the real deployment hand-over. The rest start partway through the walk, so the
 # last steps get on-policy data even while early episodes still end before they
-# reach them. Kept HIGH, not low: this is the probability of starting at phase 0,
-# so lowering it means MORE mid-walk spawns — and a mid-walk spawn drops a
-# standing robot into a phase that asks it to be mid-step, which makes most of
-# that episode recovery rather than routine and mixes the recovery turn into the
-# yaw metric. Survival is ~94 % of the episode now, so the last steps no longer
-# need rescuing.
-DANCE_START_PHASE_PROB = 0.7
+# reach them. 0.35 is the value the sway was first learned with; note that this is
+# the probability of starting at phase 0, so LOWERING it means MORE mid-walk
+# spawns, not fewer.
+DANCE_START_PHASE_PROB = 0.35
 
 # Trunk lean at each swing's peak, unchanged from the version this look was
 # signed off in. One left-right swing per step, so the look and the step rhythm
