@@ -1,4 +1,4 @@
-"""Microduck dance routine — walk DANCE_FORWARD_M forward, swaying with each step.
+"""Microduck dance routine — walk forward at DANCE_FORWARD_SPEED, swaying per step.
 
 Episodic phase policy replacing the in-place bounce (2026-10-03: the bounce
 itself tracked well, but a move whose feet are mostly airborne cannot hold a
@@ -6,7 +6,7 @@ heading — it drifted ~0.9 m per 5 s episode). Walking fixes that: the feet hav
 traction, so the heading is controllable.
 
     one period (``DANCE_PERIOD_S``) = one walk, then a short closing stand
-      [0, WALK_END)      walk DANCE_FORWARD_M at N_STEPS swaying steps
+      [0, WALK_END)      walk at DANCE_FORWARD_SPEED, N_STEPS swaying steps
       [WALK_END, 1.0)    closing stand, both feet planted
 
 The sway is FUSED into the walk, which is the only structure that has ever
@@ -19,15 +19,17 @@ from a standstill where the robot settles at 0.4 deg of trunk roll instead.
 Walking already rolls the trunk a few degrees, so the reference only has to
 amplify a motion the robot is making anyway.
 
-Distance is the spec (``DANCE_FORWARD_M``); ``N_STEPS`` only sets the cadence it
-is covered at. ``dance_forward_progress`` pays new forward ground
-(potential-based, so marching in place pays nothing) and ``dance_heading_l1``
-keeps the run straight. The gait itself is the velocity recipe's own shaping —
-``air_time`` (3.0, 0.125-0.3 s), ``foot_clearance`` and ``foot_swing_height``
-(target 0.02), ``foot_slip`` — plus ``dance_step_tracking``, the only term that
-knows WHICH foot should be up WHEN and that refuses to pay for a lift taken with
-a level trunk. The remaining terms are containment: ``dance_pitch_balance`` and
-``dance_head_hold``.
+Speed is the spec (``DANCE_FORWARD_SPEED``), not distance; ``N_STEPS`` sets the
+cadence that speed is covered at. ``dance_forward_progress`` pays new forward
+ground only up to that speed (potential-based, so marching in place pays nothing
+and racing pays no more than walking does) and ``dance_heading_l1`` keeps the run
+straight. The gait is shaped by ``dance_step_tracking``, the only term that knows
+WHICH foot should be up WHEN and that refuses to pay for a lift taken with a level
+trunk, plus the velocity recipe's `foot_clearance` / `foot_swing_height` (target
+0.02) and `foot_slip`. `air_time` is deliberately NOT among them: its command gate
+cannot close on a unit-circle phase, so it would go on paying for a lifted foot
+all through the closing stand. The remaining terms are containment:
+``dance_pitch_balance`` and ``dance_head_hold``.
 
 The squats an earlier version ended with were dropped (2026-10-04): with a 25 mm
 dip on a 0.45 s cycle the height term's Gaussian is already saturated ~20 mm away
@@ -107,24 +109,26 @@ BASE_ORIENTATION_MAX_ROLL_DEG = 5.0  # ±5° side-to-side tilt at episode start
 # button presses give).
 #
 # The walk is the whole routine; the closing stand is only the period's tail. It
-# needs no reward terms of its own — the phase decode puts every window closed
-# and every reference level there, so the posture, pitch and heading terms that
-# already exist are what hold the robot upright.
-N_REPS = 1
-WALK_S = 2.0      # N_STEPS swaying steps at 0.5 s — a normal walking cadence
+# needs no windowed reward terms of its own — the phase decode puts the sway
+# reference level and the step schedule planted there, so the posture, pitch and
+# heading terms that already exist are what hold the robot upright. What the
+# stand DOES need is for nothing to pay for lifting a foot in it; see the note
+# on `air_time` below.
+WALK_S = 4.0      # N_STEPS swaying steps at 0.5 s — a normal walking cadence
 STAND_S = 0.5
-REPS_S = N_REPS * WALK_S                       # 2.0 s
-DANCE_PERIOD_S = REPS_S + STAND_S              # 2.5 s
-EPISODE_LENGTH_S = DANCE_PERIOD_S              # 125 steps @ 50 Hz
-WALK_END = 1.0    # the walk fills every repetition; the stand is the tail
-REP_END = REPS_S / DANCE_PERIOD_S
-N_STEPS = 4
+DANCE_PERIOD_S = WALK_S + STAND_S              # 4.5 s
+EPISODE_LENGTH_S = DANCE_PERIOD_S              # 225 steps @ 50 Hz
+WALK_END = 1.0    # the walk fills the period up to the stand
+REP_END = WALK_S / DANCE_PERIOD_S
+N_STEPS = 8
 
 # Reverse-curriculum spawn mix: the fraction of episodes that start at phase 0,
 # the real deployment hand-over. The rest start partway through the walk, so the
 # last steps get on-policy data even while early episodes still end before they
-# reach them.
-DANCE_START_PHASE_PROB = 0.35
+# reach them. Kept low: a mid-walk spawn drops a standing robot into a phase that
+# asks it to be mid-step, and the measured yaw drift is largely per-episode
+# scatter rather than a fixed gait bias.
+DANCE_START_PHASE_PROB = 0.1
 
 # Trunk lean at each swing's peak, unchanged from the version this look was
 # signed off in. One left-right swing per step, so the look and the step rhythm
@@ -138,11 +142,12 @@ DANCE_SWAY_AMPLITUDE = math.radians(DANCE_SWAY_DEG)
 # where the reference itself is small.
 DANCE_LEAN_FRAC = 0.3
 
-# How far the walk must carry the robot. This is the spec — the step count above
-# only sets the cadence it is covered at. Paid as potential-based progress, so it
-# is a distance the policy must cover, not a per-step rate it can farm. 20 cm
-# over the 2 s walk is 0.1 m/s, a quarter of the velocity recipe's ±0.4 m/s.
-DANCE_FORWARD_M = 0.20
+# The speed the walk is asked to hold, in m/s. Not a distance: the routine is
+# speed-commanded, so the ground covered is this times WALK_S (0.10 m/s over 4 s
+# = 40 cm). Paid as potential-based progress that saturates here, so walking
+# faster earns no more than this and the policy has no reason to race — see
+# `dance_forward_progress`. A quarter of the velocity recipe's ±0.4 m/s.
+DANCE_FORWARD_SPEED = 0.10
 
 import mujoco as _mujoco
 import mjlab.terrains as terrain_gen
@@ -375,7 +380,7 @@ def make_microduck_dance_env_cfg(
     # --- The routine: one walk that sways with its own steps -------------------
     # Every term below is phase-referenced, so none of them can be farmed by
     # standing still, and each only pays inside its own window.
-    dance_cmd = {"command_name": "twist", "n_reps": N_REPS, "rep_end": REP_END}
+    dance_cmd = {"command_name": "twist", "rep_end": REP_END}
     walk_params = {**dance_cmd, "walk_end": WALK_END}
     step_params = {**walk_params, "n_steps": N_STEPS}
 
@@ -414,16 +419,18 @@ def make_microduck_dance_env_cfg(
     cfg.rewards["dance_forward_progress"] = RewardTermCfg(
         func=microduck_mdp.dance_forward_progress,
         weight=0.0,  # final 4.0, ramped by the forward_progress_weight curriculum
-        params={**walk_params, "target_distance": DANCE_FORWARD_M},
+        params={**walk_params, "setpoint_speed": DANCE_FORWARD_SPEED},
     )
 
-    # The walker drifts 6–8°/s open loop, so the walk would visibly turn the robot
-    # (≤ 0 → POSITIVE weight). Whole-routine, like the bounce's heading pair: the
-    # sway shifts the weight side to side and turns the robot just as readily as
-    # the steps do.
+    # The walker drifts 6–8°/s open loop, and the sway turns the robot just as
+    # readily by shifting the weight side to side, so without this the routine
+    # visibly curves: a 1000-iteration run ended 52° off its spawn heading
+    # (≤ 0 → POSITIVE weight). L1, so oscillation cancels and only the heading
+    # error itself is charged. 3.0 rather than the bounce's 1.0: at 1.0 the same
+    # run measured a 32° mean error, i.e. the term was not enforcing anything.
     cfg.rewards["dance_heading_l1"] = RewardTermCfg(
         func=microduck_mdp.dance_heading_l1,
-        weight=1.0,
+        weight=3.0,
         params={"command_name": "twist"},
     )
 
@@ -459,19 +466,21 @@ def make_microduck_dance_env_cfg(
     # weight is the sway version's own.
     cfg.rewards["pose"].weight = 2.0
 
-    # Gait shaping straight from the velocity recipe, values and all: `air_time`
-    # pays for a foot that stays off the ground 0.125-0.3 s, `foot_clearance` and
-    # `foot_swing_height` shape how high it gets, `foot_slip` damps scraping. An
-    # earlier version deleted `air_time` because its command gate can never close
-    # on a unit-circle phase — that objection does not apply here: the feet are
-    # meant to lift in BOTH halves (they are the steps, and the sway's
-    # counterweight), so an always-armed gate is what we want.
-    cfg.rewards["air_time"].weight = 3.0
-    cfg.rewards["air_time"].params["threshold_min"] = 0.125
-    cfg.rewards["air_time"].params["threshold_max"] = 0.300
+    # Gait shaping straight from the velocity recipe, values and all:
+    # `foot_clearance` and `foot_swing_height` shape how high the swing gets,
+    # `foot_slip` damps scraping. Lift TIMING is `dance_step_tracking`'s job.
+    #
+    # `air_time` is removed, not tuned. Its `command_threshold` gate can never
+    # close on a unit-circle phase (the command norm is always 1.0), so it stays
+    # armed in the closing stand, where every dance term is off and nothing else
+    # competes: a 1000-iteration run kept one foot airborne for 89 % of the stand
+    # and never stood at all, because lifting a foot there paid 3.0/step. Nothing
+    # needs to be added in its place — `dance_step_tracking` already schedules the
+    # lift, and the two foot-shape terms above still price the swing.
+    cfg.rewards.pop("air_time", None)
     cfg.rewards["foot_clearance"].params["target_height"] = 0.02
     cfg.rewards["foot_swing_height"].params["target_height"] = 0.02
-    for _term in ("air_time", "foot_clearance", "foot_swing_height", "foot_slip"):
+    for _term in ("foot_clearance", "foot_swing_height", "foot_slip"):
         cfg.rewards[_term].params["command_threshold"] = 0.01
     cfg.rewards["foot_slip"].weight = -0.4
 

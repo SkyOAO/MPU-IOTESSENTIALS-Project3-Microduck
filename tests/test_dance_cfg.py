@@ -3,9 +3,12 @@
 These lock the phase conventions, the reward wiring, and the structural
 decisions that are easy to undo by accident: the sway MUST stay FUSED into the
 walk (one lean per step — the split "walk level, then sway on the spot" version
-never produced a lean in any run), and the squats MUST stay out of the term list
-(a 25 mm dip on a 0.45 s cycle gave a saturated height Gaussian with no gradient,
-and the trunk never left its standing height).
+never produced a lean in any run); the stock `feet_air_time` MUST stay out (its
+command gate can never close on a unit-circle phase, so it keeps paying for a
+lifted foot through the closing stand — measured, 89 % of the stand was spent on
+one foot); and the squats MUST stay out of the term list (a 25 mm dip on a 0.45 s
+cycle gave a saturated height Gaussian with no gradient, and the trunk never left
+its standing height).
 """
 
 import math
@@ -16,14 +19,13 @@ import torch
 
 from mjlab_microduck.tasks import mdp as microduck_mdp
 from mjlab_microduck.tasks.microduck_dance_env_cfg import (
-    DANCE_FORWARD_M,
+    DANCE_FORWARD_SPEED,
     DANCE_LEAN_FRAC,
     DANCE_PERIOD_S,
     DANCE_START_PHASE_PROB,
     DANCE_SWAY_AMPLITUDE,
     DANCE_SWAY_DEG,
     EPISODE_LENGTH_S,
-    N_REPS,
     N_STEPS,
     REP_END,
     STAND_S,
@@ -44,12 +46,12 @@ def _cmd(phases):
 
 
 def _local(t):
-    """Command slot for a repetition-local phase (inverse of dance_local_phase).
+    """Command slot for a walk-window phase (inverse of dance_local_phase).
 
-    The repetitions occupy [0, REP_END) of the period, so a local phase t in the
-    first repetition is at period phase t / N_REPS * REP_END.
+    The walk occupies [0, REP_END) of the period, so a walk-window phase t is at
+    period phase t * REP_END.
     """
-    return _cmd([t / N_REPS * REP_END])
+    return _cmd([t * REP_END])
 
 
 def _tail(frac):
@@ -65,13 +67,12 @@ def test_phase_is_recovered_from_the_runtime_command_slot():
     assert torch.allclose(microduck_mdp.dance_phase(_cmd(phases)), phases, atol=1e-6)
 
 
-def test_local_phase_wraps_once_per_repetition():
-    uint = torch.tensor([0.0, 0.25, 0.5, 0.75, 0.999])   # through the repetitions
-    local = microduck_mdp.dance_local_phase(_cmd(uint * REP_END), N_REPS, REP_END)
+def test_local_phase_stretches_the_walk_window_over_unit_range():
+    uint = torch.tensor([0.0, 0.25, 0.5, 0.75, 1.0])
+    local = microduck_mdp.dance_local_phase(_cmd(uint * REP_END), REP_END)
     # the round trip through cos/sin/atan2 is not exact at the wrap, so compare
     # on the circle rather than on the raw value
-    expected = (uint * N_REPS) % 1.0
-    diff = (local - expected).abs()
+    diff = (local - uint).abs()
     assert (torch.minimum(diff, 1.0 - diff) < 1e-4).all()
 
 
@@ -79,7 +80,7 @@ def test_the_closing_stand_reads_as_local_phase_one():
     """The tail must close every window at once, or the robot would keep walking
     through what is supposed to be a stand: local phase 1.0 is outside the walk
     window and outside the step schedule."""
-    tail = microduck_mdp.dance_local_phase(_tail(0.5), N_REPS, REP_END)
+    tail = microduck_mdp.dance_local_phase(_tail(0.5), REP_END)
     assert tail.item() == pytest.approx(1.0)
     assert tail.item() >= WALK_END                     # walk window closed
     assert _sway_ref(tail.item()) == 0.0               # sway reference level
@@ -87,15 +88,14 @@ def test_the_closing_stand_reads_as_local_phase_one():
     assert sched.tolist() == [[0.0, 0.0]]              # both feet planted
 
 
-def test_the_walk_fills_the_routine_and_the_stand_is_its_tail():
-    """One pass, no split: the walk occupies the whole repetition and the only
-    thing after it is the closing stand."""
-    assert N_REPS == 1
+def test_the_walk_fills_the_period_and_the_stand_is_its_tail():
+    """No split: the walk occupies the whole repeatable part of the period and
+    the only thing after it is the closing stand."""
     assert WALK_END == pytest.approx(1.0)
     assert REP_END * DANCE_PERIOD_S == pytest.approx(WALK_S)
     assert (1.0 - REP_END) * DANCE_PERIOD_S == pytest.approx(STAND_S)  # closing stand
     assert EPISODE_LENGTH_S == pytest.approx(DANCE_PERIOD_S)
-    assert WALK_S == pytest.approx(N_STEPS * 0.5)          # 4 steps at 0.5 s
+    assert WALK_S == pytest.approx(N_STEPS * 0.5)          # steps at 0.5 s
 
 
 def test_episode_stays_short():
@@ -104,9 +104,9 @@ def test_episode_stays_short():
     assert EPISODE_LENGTH_S <= 7.0
 
 
-def test_the_walk_is_specified_by_distance_not_by_step_count():
-    """20 cm is the spec; N_STEPS only sets the cadence it is covered at."""
-    assert DANCE_FORWARD_M == pytest.approx(0.20)
+def test_the_walk_is_specified_by_speed_not_by_step_count():
+    """Speed is the spec; N_STEPS only sets the cadence it is covered at."""
+    assert DANCE_FORWARD_SPEED == pytest.approx(0.10)
 
 
 def test_sway_is_exaggerated_but_physical():
@@ -244,7 +244,6 @@ def test_sway_tracking_is_maximal_when_the_lean_matches_the_reference():
     score = microduck_mdp.dance_sway_tracking(
         env,
         command_name="twist",
-        n_reps=N_REPS,
         rep_end=REP_END,
         walk_end=WALK_END,
         n_steps=N_STEPS,
@@ -262,7 +261,6 @@ def test_sway_tracking_does_not_pay_full_marks_for_standing_level():
     score = microduck_mdp.dance_sway_tracking(
         env,
         command_name="twist",
-        n_reps=N_REPS,
         rep_end=REP_END,
         walk_end=WALK_END,
         n_steps=N_STEPS,
@@ -281,8 +279,7 @@ def test_sway_tracking_pays_nothing_in_the_closing_stand():
         return microduck_mdp.dance_sway_tracking(
             env,
             command_name="twist",
-            n_reps=N_REPS,
-            rep_end=REP_END,
+                rep_end=REP_END,
             walk_end=WALK_END,
             n_steps=N_STEPS,
             amplitude=DANCE_SWAY_AMPLITUDE,
@@ -301,7 +298,6 @@ def test_sway_l1_charges_the_lean_error_in_radians():
     score = microduck_mdp.dance_sway_l1(
         env,
         command_name="twist",
-        n_reps=N_REPS,
         rep_end=REP_END,
         walk_end=WALK_END,
         n_steps=N_STEPS,
@@ -316,7 +312,6 @@ def test_sway_l1_charges_the_lean_error_in_radians():
     assert microduck_mdp.dance_sway_l1(
         matching,
         command_name="twist",
-        n_reps=N_REPS,
         rep_end=REP_END,
         walk_end=WALK_END,
         n_steps=N_STEPS,
@@ -330,7 +325,6 @@ def _step(env):
         env,
         command_name="twist",
         sensor_name="feet_ground_contact",
-        n_reps=N_REPS,
         rep_end=REP_END,
         walk_end=WALK_END,
         n_steps=N_STEPS,
@@ -381,8 +375,8 @@ def _progress_env(local):
 
 def _progress(env):
     return microduck_mdp.dance_forward_progress(
-        env, command_name="twist", n_reps=N_REPS, rep_end=REP_END,
-        walk_end=WALK_END, target_distance=DANCE_FORWARD_M,
+        env, command_name="twist", rep_end=REP_END,
+        walk_end=WALK_END, setpoint_speed=DANCE_FORWARD_SPEED,
     )
 
 
@@ -393,20 +387,34 @@ def test_forward_progress_pays_only_for_new_ground():
 
     asset.data.root_link_pos_w[0, 0] = 0.01
     stepped = _progress(env)
-    # Rate-normalised: 1 cm of new ground at a 0.22 m scale, per control step.
-    assert stepped.item() == pytest.approx(0.01 / (env.step_dt * DANCE_FORWARD_M), rel=1e-5)
+    # Saturating rate: 1 cm in one control step is 0.5 m/s, well past the
+    # setpoint, so the step pays the ceiling of 1.0 and the excess is forfeited.
+    assert stepped.item() == pytest.approx(1.0)
 
     # Walking back does not pay again, and the frontier is not un-earned.
     asset.data.root_link_pos_w[0, 0] = 0.0
     assert _progress(env).item() == 0.0
 
 
-def test_forward_progress_is_capped_at_the_target_distance():
+def test_forward_progress_saturates_at_the_setpoint_speed():
+    """Racing past the setpoint forfeits the excess, so the policy has nothing to
+    gain from running: a step at 0.5 m/s pays exactly what a step at 0.1 m/s does,
+    and a step at half the setpoint pays half."""
     env = _progress_env(0.0)
-    env.scene["robot"].data.root_link_pos_w[0, 0] = 3.0 * DANCE_FORWARD_M
-    assert _progress(env).item() > 0.0
-    env.scene["robot"].data.root_link_pos_w[0, 0] = 6.0 * DANCE_FORWARD_M
-    assert _progress(env).item() == pytest.approx(0.0, abs=1e-9)
+    asset = env.scene["robot"]
+    at_setpoint = DANCE_FORWARD_SPEED * env.step_dt
+
+    asset.data.root_link_pos_w[0, 0] = at_setpoint
+    assert _progress(env).item() == pytest.approx(1.0)
+
+    # 5x the setpoint in one step still pays 1.0, no more.
+    asset.data.root_link_pos_w[0, 0] = at_setpoint + 5.0 * at_setpoint
+    assert _progress(env).item() == pytest.approx(1.0)
+
+    # Half the setpoint pays half.
+    env = _progress_env(0.0)
+    env.scene["robot"].data.root_link_pos_w[0, 0] = 0.5 * at_setpoint
+    assert _progress(env).item() == pytest.approx(0.5)
 
 
 def test_forward_progress_is_inactive_during_the_closing_stand():
@@ -425,7 +433,7 @@ def test_cfg_reuses_the_shared_phase_command():
     assert isinstance(command, microduck_mdp.GroundPickPhaseCommandCfg)
     assert command.period == DANCE_PERIOD_S
     # Reverse curriculum: a slice keeps the real deployment start (phase 0), the
-    # rest are scattered so the second repetition is practised on its own.
+    # rest are scattered so the last steps get on-policy data of their own.
     assert command.randomize_phase is True
     assert command.zero_phase_prob == pytest.approx(DANCE_START_PHASE_PROB)
     assert 0.0 < DANCE_START_PHASE_PROB < 1.0
@@ -438,7 +446,7 @@ def test_the_routine_terms_are_registered():
         "dance_sway_l1": 2.0,
         "dance_step_tracking": 3.0,
         "dance_forward_progress": 0.0,  # ramped by the forward_progress_weight curriculum
-        "dance_heading_l1": 1.0,
+        "dance_heading_l1": 3.0,
         "dance_pitch_balance": 4.0,
         "dance_head_hold": 0.4,
     }
@@ -470,8 +478,8 @@ def test_the_squat_is_gone():
 
 def test_the_bounce_terms_are_gone():
     """The in-place bounce was replaced, not patched: none of its task terms may
-    come back. The stock `air_time` is NOT in that list — it is the velocity
-    recipe's own gait shaping and the routine keeps it."""
+    come back, and neither may the stock `air_time`, whose always-open command
+    gate would pay for lifting a foot straight through the closing stand."""
     cfg = make_microduck_dance_env_cfg()
     for name in (
         "bounce_roll_tracking",
@@ -483,9 +491,7 @@ def test_the_bounce_terms_are_gone():
         "bounce_head_hold",
     ):
         assert name not in cfg.rewards, name
-    assert cfg.rewards["air_time"].weight == pytest.approx(3.0)
-    assert cfg.rewards["air_time"].params["threshold_min"] == pytest.approx(0.125)
-    assert cfg.rewards["air_time"].params["threshold_max"] == pytest.approx(0.300)
+    assert "air_time" not in cfg.rewards
     for name in (
         "bounce_phase",
         "bounce_roll_reference",

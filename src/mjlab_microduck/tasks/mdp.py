@@ -5042,11 +5042,11 @@ class GroundPickPhaseCommandCfg(UniformVelocityCommandCfg):
 
 
 # --------------------------------------------------------------------------- #
-# Dance — walk three steps with the bounce's sway, stand (routine twice)        #
+# Dance — walk N_STEPS swaying steps, stand                                       #
 # --------------------------------------------------------------------------- #
 #
-# One period (period = cfg's DANCE_PERIOD_S) holds N_REPS identical repetitions.
-# Inside one repetition, with the local phase running over [0, 1):
+# One period (cfg's DANCE_PERIOD_S) holds the walk and the stand that ends it,
+# with the local phase running over [0, 1):
 #
 #   [0, WALK_END)            walk forward N_STEPS steps; the trunk sways with
 #                            each step (the exaggerated bounce look)
@@ -5073,20 +5073,16 @@ def dance_phase(command: torch.Tensor) -> torch.Tensor:
     return torch.atan2(command[:, 1], command[:, 0]) / (2.0 * math.pi) % 1.0
 
 
-def dance_local_phase(
-    command: torch.Tensor, n_reps: int, rep_end: float
-) -> torch.Tensor:
-    """Per-repetition phase in [0, 1), and exactly 1.0 during the closing stand.
+def dance_local_phase(command: torch.Tensor, rep_end: float) -> torch.Tensor:
+    """Walk-window phase in [0, 1), and exactly 1.0 during the closing stand.
 
-    The N_REPS repetitions occupy [0, rep_end) of the period and everything after
-    that is the stand the routine ends on. Returning 1.0 there closes every
-    window test at once — the walk and its foot lifts both stop — so the stand
-    needs no terms of its own: the sway reference is level, the feet stay
-    planted, and the posture / pitch / heading terms already hold it.
+    The walk occupies [0, rep_end) of the period and everything after that is the
+    stand the routine ends on. Returning 1.0 there closes every window test at
+    once — the walk and its foot lifts both stop — so the stand needs no windowed
+    terms of its own: the sway reference is level, the step schedule plants both
+    feet, and the posture / pitch / heading terms already hold it.
     """
-    u = torch.clamp(dance_phase(command) / rep_end, max=1.0)
-    local = (u * n_reps) % 1.0
-    return torch.where(u >= 1.0, torch.ones_like(local), local)
+    return torch.clamp(dance_phase(command) / rep_end, max=1.0)
 
 
 def _dance_command(env: ManagerBasedRlEnv, command_name: str) -> torch.Tensor:
@@ -5211,7 +5207,6 @@ def dance_step_schedule(
 def dance_sway_tracking(
     env: ManagerBasedRlEnv,
     command_name: str,
-    n_reps: int,
     rep_end: float,
     walk_end: float,
     n_steps: int,
@@ -5232,7 +5227,7 @@ def dance_sway_tracking(
     the 5.0 for a robot that never leans at all.
     """
     asset: Entity = env.scene[asset_cfg.name]
-    local = dance_local_phase(_dance_command(env, command_name), n_reps, rep_end)
+    local = dance_local_phase(_dance_command(env, command_name), rep_end)
     reference = dance_sway_reference(local, walk_end, n_steps, amplitude)
     in_walk = (local < walk_end).to(torch.float32)
     return torch.exp(-(((_dance_trunk_roll(asset) - reference) / std) ** 2)) * in_walk
@@ -5241,7 +5236,6 @@ def dance_sway_tracking(
 def dance_sway_l1(
     env: ManagerBasedRlEnv,
     command_name: str,
-    n_reps: int,
     rep_end: float,
     walk_end: float,
     n_steps: int,
@@ -5256,7 +5250,7 @@ def dance_sway_l1(
     robot to terminate early.
     """
     asset: Entity = env.scene[asset_cfg.name]
-    local = dance_local_phase(_dance_command(env, command_name), n_reps, rep_end)
+    local = dance_local_phase(_dance_command(env, command_name), rep_end)
     reference = dance_sway_reference(local, walk_end, n_steps, amplitude)
     in_walk = (local < walk_end).to(torch.float32)
     return -(_dance_trunk_roll(asset) - reference).abs() * in_walk
@@ -5266,7 +5260,6 @@ def dance_step_tracking(
     env: ManagerBasedRlEnv,
     command_name: str,
     sensor_name: str,
-    n_reps: int,
     rep_end: float,
     walk_end: float,
     n_steps: int,
@@ -5276,12 +5269,19 @@ def dance_step_tracking(
 ) -> torch.Tensor:
     """The scheduled foot is the one OFF the ground; the other is not graded.
 
-    This is the timing half of the gait: `feet_air_time` (kept, from the velocity
-    recipe) pays for a foot that stays up 0.125-0.3 s and `foot_clearance` /
-    `foot_swing_height` shape how high it gets, but neither of them knows WHICH
-    foot or WHEN. It is also what couples the lean to the lift — leaning LEFT is
-    scheduled at the same phase as the RIGHT foot being up — so the step and the
-    sway are one motion rather than two to be balanced against each other.
+    This is the timing half of the gait, and it is the ONLY foot-lift reward:
+    `foot_clearance` and `foot_swing_height` shape how high the swing gets, but
+    neither knows WHICH foot or WHEN. It is also what couples the lean to the
+    lift — leaning LEFT is scheduled at the same phase as the RIGHT foot being up
+    — so the step and the sway are one motion rather than two to be balanced
+    against each other.
+
+    The stock `feet_air_time` is NOT carried alongside it. Its ``command_threshold``
+    gate can never close here (the twist slot carries a unit-circle phase, so the
+    command norm is always 1.0), which made it an always-open payment for lifting
+    a foot — measured in the closing stand, where every other dance term is off
+    and it was therefore free money: a 1000-iteration run kept one foot airborne
+    for 89 % of the stand instead of standing on it.
 
     The lift only pays while the trunk is actually leaning the way that phase
     asks, at least ``lean_frac`` of the way there. Without that condition the
@@ -5293,7 +5293,7 @@ def dance_step_tracking(
     farmed by stepping while staying level.
     """
     asset: Entity = env.scene[asset_cfg.name]
-    local = dance_local_phase(_dance_command(env, command_name), n_reps, rep_end)
+    local = dance_local_phase(_dance_command(env, command_name), rep_end)
     schedule = dance_step_schedule(local, walk_end, n_steps)
     air_time = env.scene[sensor_name].data.current_air_time
     assert air_time is not None, f"Sensor '{sensor_name}' has no air-time field."
@@ -5313,47 +5313,40 @@ def dance_step_tracking(
 def dance_forward_progress(
     env: ManagerBasedRlEnv,
     command_name: str,
-    n_reps: int,
     rep_end: float,
     walk_end: float,
-    target_distance: float,
-    max_paid_rate: float = 0.5,
+    setpoint_speed: float,
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
-    """MAIN walk term: pay increments of the furthest forward ground covered.
+    """MAIN walk term: pay forward ground covered, up to a commanded speed.
 
     Potential-based (the roulade recipe), so marching in place, rocking and
-    standing all pay 0/step — only NEW forward displacement pays. Paid only
-    while the walk window is open (drifting while standing is not a walk), and the
-    increment is capped at ``max_paid_rate`` m/s so lunging or falling forward
-    cannot out-earn stepping.
+    standing all pay 0/step — only NEW forward displacement pays, and it pays
+    only while the walk window is open (drifting through the stand is not a walk).
 
-    Normalised by ``step_dt`` like ``roulade_progress``: the term is a RATE, not
-    a one-off bounty. Without it a full routine's walking is worth exactly one
-    unit for the whole episode, which is ~0.02 per step — 30x smaller than the
-    gradient of every other task term, and therefore invisible to PPO (the first
-    version of this term was worth 4.0 per EPISODE against a sway term worth
-    5.0 per STEP).
+    The per-step payment saturates at ``setpoint_speed``: walking at the setpoint
+    earns 1.0/step, walking faster earns no more, walking slower earns
+    proportionally less. That saturation is what stops the policy racing. An
+    earlier version capped a whole-episode DISTANCE budget instead, and a
+    1000-iteration run reached its 20 cm about halfway through the walk window at
+    0.23 m/s — 2.3x the speed the routine was designed around — and then simply
+    kept stepping, ending 0.44 m out with nothing to stop it.
 
-    ``target_distance`` is now the scale of that rate: walking at
-    ``target_distance`` over the routine's walk windows earns 1.0 per step. The
-    frontier is capped there too, so the whole term is bounded by
-    ``weight / step_dt`` per episode.
+    It is also the no-jackpot guard: a lunge or a fall can earn at most
+    1.0/step, exactly what an honest step at the setpoint earns.
     """
     asset: Entity = env.scene[asset_cfg.name]
-    local = dance_local_phase(_dance_command(env, command_name), n_reps, rep_end)
+    local = dance_local_phase(_dance_command(env, command_name), rep_end)
 
     frontier = torch.maximum(env._dance_fwd_max, _dance_forward_offset(env, asset))
-    frontier = torch.clamp(frontier, max=target_distance)
     delta = torch.clamp(frontier - env._dance_fwd_paid, min=0.0)
-    # Faster than max_paid_rate m/s forfeits the excess (roulade semantics), so a
-    # stumble forward cannot out-earn walking.
-    delta = torch.clamp(delta, max=max_paid_rate * env.step_dt)
+    # Faster than the setpoint forfeits the excess (roulade semantics).
+    delta = torch.clamp(delta, max=setpoint_speed * env.step_dt)
     env._dance_fwd_max = frontier
     env._dance_fwd_paid = torch.maximum(env._dance_fwd_paid, frontier)
 
     in_walk = (local < walk_end).to(torch.float32)
-    return in_walk * delta / (env.step_dt * target_distance)
+    return in_walk * delta / (env.step_dt * setpoint_speed)
 
 
 def dance_heading_l1(
@@ -5364,9 +5357,9 @@ def dance_heading_l1(
     """−|yaw − spawn yaw| for the whole routine (≤ 0 → POSITIVE weight).
 
     The walker drifts ~6–8°/s open-loop (measured in the CPU/BAM rehearsal) and
-    the sway shifts the weight from side to side, so without this the routine
-    turns visibly and the second repetition starts crooked. The bounce carried
-    the same pair of heading terms for the same reason.
+    the sway shifts the weight from side to side, so without this the walk turns
+    visibly — a 1000-iteration run ended 52° off its spawn heading. L1, so the
+    sway's oscillation cancels and only the heading error itself is charged.
     """
     asset: Entity = env.scene[asset_cfg.name]
     del command_name  # whole-routine quantity: the phase is not read
@@ -5417,7 +5410,6 @@ def dance_head_hold(
 def dance_metric_sway_amp_deg(
     env: ManagerBasedRlEnv,
     command_name: str,
-    n_reps: int,
     rep_end: float,
     walk_end: float,
     n_steps: int,
@@ -5428,11 +5420,11 @@ def dance_metric_sway_amp_deg(
     Twice the roll times the reference's own shape: its episode average
     (reduce="mean") is the part of the roll in phase with the commanded rhythm,
     which a single outlier cannot set. The scale is ``walk share x lean``, so a
-    perfect 15 deg swing over a 2.0 s walk inside a 2.5 s period reads ~12 deg,
+    perfect 15 deg swing over a 4.0 s walk inside a 4.5 s period reads ~13.3 deg,
     not 15.
     """
     asset: Entity = env.scene[asset_cfg.name]
-    local = dance_local_phase(_dance_command(env, command_name), n_reps, rep_end)
+    local = dance_local_phase(_dance_command(env, command_name), rep_end)
     shape = torch.sin(2.0 * math.pi * n_steps * local / walk_end)
     in_walk = (local < walk_end).to(torch.float32)
     return 2.0 * _dance_trunk_roll(asset) * shape * in_walk * _DEG
