@@ -5338,38 +5338,47 @@ def dance_forward_progress(
     command_name: str,
     rep_end: float,
     walk_end: float,
-    setpoint_speed: float,
+    target_distance: float,
+    max_paid_rate: float = 0.5,
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
-    """MAIN walk term: pay forward ground covered, up to a commanded speed.
+    """MAIN walk term: pay increments of the furthest forward ground covered.
 
     Potential-based (the roulade recipe), so marching in place, rocking and
-    standing all pay 0/step — only NEW forward displacement pays, and it pays
-    only while the walk window is open (drifting through the stand is not a walk).
+    standing all pay 0/step — only NEW forward displacement pays. Paid only while
+    the walk window is open (drifting through the closing stand is not a walk).
 
-    The per-step payment saturates at ``setpoint_speed``: walking at the setpoint
-    earns 1.0/step, walking faster earns no more, walking slower earns
-    proportionally less. That saturation is what stops the policy racing. An
-    earlier version capped a whole-episode DISTANCE budget instead, and a
-    1000-iteration run reached its 20 cm about halfway through the walk window at
-    0.23 m/s — 2.3x the speed the routine was designed around — and then simply
-    kept stepping, ending 0.44 m out with nothing to stop it.
+    Normalised by ``step_dt``: the term is a RATE, not a one-off bounty. Without
+    that a routine's walking is worth one unit for the whole episode, which is
+    ~0.02 per step — 30x smaller than the gradient of every other task term, and
+    therefore invisible to PPO.
 
-    It is also the no-jackpot guard: a lunge or a fall can earn at most
-    1.0/step, exactly what an honest step at the setpoint earns.
+    ``target_distance`` is the scale of that rate and the point at which the
+    frontier stops paying. It is NOT a constraint on how far the robot walks and
+    it is NOT a speed command: a run of this exact term reached its 20 cm budget
+    in about half the walk window and then kept going, ending 0.44 m out. Capping
+    the RATE instead (a speed setpoint) was tried and is worse — it halved the
+    stride, and the sway lives in the weight transfer of a long stride: over 1000
+    iterations that version walked 0.7 m with `air_time` fully collected and never
+    rolled its trunk once.
+
+    The per-step cap (``max_paid_rate``) is the no-jackpot guard: a lunge or a
+    fall cannot out-earn stepping.
     """
     asset: Entity = env.scene[asset_cfg.name]
     local = dance_local_phase(_dance_command(env, command_name), rep_end)
 
     frontier = torch.maximum(env._dance_fwd_max, _dance_forward_offset(env, asset))
+    frontier = torch.clamp(frontier, max=target_distance)
     delta = torch.clamp(frontier - env._dance_fwd_paid, min=0.0)
-    # Faster than the setpoint forfeits the excess (roulade semantics).
-    delta = torch.clamp(delta, max=setpoint_speed * env.step_dt)
+    # Faster than max_paid_rate forfeits the excess (roulade semantics), so a
+    # stumble forward cannot out-earn walking.
+    delta = torch.clamp(delta, max=max_paid_rate * env.step_dt)
     env._dance_fwd_max = frontier
     env._dance_fwd_paid = torch.maximum(env._dance_fwd_paid, frontier)
 
     in_walk = (local < walk_end).to(torch.float32)
-    return in_walk * delta / (env.step_dt * setpoint_speed)
+    return in_walk * delta / (env.step_dt * target_distance)
 
 
 def dance_heading_l1(

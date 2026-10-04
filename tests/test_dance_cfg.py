@@ -19,7 +19,7 @@ import torch
 
 from mjlab_microduck.tasks import mdp as microduck_mdp
 from mjlab_microduck.tasks.microduck_dance_env_cfg import (
-    DANCE_FORWARD_SPEED,
+    DANCE_FORWARD_M,
     DANCE_LEAN_FRAC,
     DANCE_PERIOD_S,
     DANCE_START_PHASE_PROB,
@@ -104,9 +104,9 @@ def test_episode_stays_short():
     assert EPISODE_LENGTH_S <= 7.0
 
 
-def test_the_walk_is_specified_by_speed_not_by_step_count():
-    """Speed is the spec; N_STEPS only sets the cadence it is covered at."""
-    assert DANCE_FORWARD_SPEED == pytest.approx(0.10)
+def test_the_walk_reward_is_scaled_by_a_distance_not_by_a_step_count():
+    """N_STEPS only sets the cadence the walk is covered at."""
+    assert DANCE_FORWARD_M == pytest.approx(0.20)
 
 
 def test_sway_is_exaggerated_but_physical():
@@ -407,7 +407,7 @@ def _progress_env(local):
 def _progress(env):
     return microduck_mdp.dance_forward_progress(
         env, command_name="twist", rep_end=REP_END,
-        walk_end=WALK_END, setpoint_speed=DANCE_FORWARD_SPEED,
+        walk_end=WALK_END, target_distance=DANCE_FORWARD_M,
     )
 
 
@@ -418,34 +418,24 @@ def test_forward_progress_pays_only_for_new_ground():
 
     asset.data.root_link_pos_w[0, 0] = 0.01
     stepped = _progress(env)
-    # Saturating rate: 1 cm in one control step is 0.5 m/s, well past the
-    # setpoint, so the step pays the ceiling of 1.0 and the excess is forfeited.
-    assert stepped.item() == pytest.approx(1.0)
+    # Rate-normalised: 1 cm of new ground at a 0.20 m scale, per control step.
+    assert stepped.item() == pytest.approx(0.01 / (env.step_dt * DANCE_FORWARD_M), rel=1e-5)
 
     # Walking back does not pay again, and the frontier is not un-earned.
     asset.data.root_link_pos_w[0, 0] = 0.0
     assert _progress(env).item() == 0.0
 
 
-def test_forward_progress_saturates_at_the_setpoint_speed():
-    """Racing past the setpoint forfeits the excess, so the policy has nothing to
-    gain from running: a step at 0.5 m/s pays exactly what a step at 0.1 m/s does,
-    and a step at half the setpoint pays half."""
+def test_forward_progress_stops_paying_past_the_target_distance():
+    """The frontier is a reward scale, not a constraint: once the target is
+    covered the term pays nothing more, but nothing stops the robot walking on —
+    a run of this term ended 0.44 m out against a 0.20 m scale."""
     env = _progress_env(0.0)
     asset = env.scene["robot"]
-    at_setpoint = DANCE_FORWARD_SPEED * env.step_dt
-
-    asset.data.root_link_pos_w[0, 0] = at_setpoint
-    assert _progress(env).item() == pytest.approx(1.0)
-
-    # 5x the setpoint in one step still pays 1.0, no more.
-    asset.data.root_link_pos_w[0, 0] = at_setpoint + 5.0 * at_setpoint
-    assert _progress(env).item() == pytest.approx(1.0)
-
-    # Half the setpoint pays half.
-    env = _progress_env(0.0)
-    env.scene["robot"].data.root_link_pos_w[0, 0] = 0.5 * at_setpoint
-    assert _progress(env).item() == pytest.approx(0.5)
+    asset.data.root_link_pos_w[0, 0] = 3.0 * DANCE_FORWARD_M
+    assert _progress(env).item() > 0.0
+    asset.data.root_link_pos_w[0, 0] = 6.0 * DANCE_FORWARD_M
+    assert _progress(env).item() == pytest.approx(0.0, abs=1e-9)
 
 
 def test_forward_progress_is_inactive_during_the_closing_stand():
