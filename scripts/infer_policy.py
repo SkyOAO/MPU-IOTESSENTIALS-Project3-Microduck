@@ -3,20 +3,37 @@
 
 import argparse
 import csv
+import json
 import math
 import os
 import pickle
 import queue
-import select
+import socket
 import sys
-import termios
 import threading
 import time
-import tty
 import numpy as np
 import mujoco
 import mujoco.viewer
 import onnxruntime as ort
+
+# ---------------------------------------------------------------------------
+# 跨平台非阻塞键盘输入：
+#   Linux / macOS : 用原生 termios + tty + select（脚本原来的实现）
+#   Windows       : 用 msvcrt
+# 其他平台（stdin 非 TTY，如 IDE 重定向）：安全降级为空实现，不影响脚本
+# ---------------------------------------------------------------------------
+_IS_WINDOWS = sys.platform.startswith("win")
+try:
+    if _IS_WINDOWS:
+        import msvcrt  # noqa: F401
+    else:
+        import select
+        import termios
+        import tty
+    _HAS_TTY_LIBS = True
+except ImportError:
+    _HAS_TTY_LIBS = False
 
 MICRODUCK_XML = "src/mjlab_microduck/robot/microduck/scene.xml"
 # MICRODUCK_XML = "src/mjlab_microduck/robot/microduck/scene_ramps.xml"
@@ -36,6 +53,9 @@ BAM_KP_FW = 200.0                 # microduck's preserved firmware stiffness
 BAM_VIN_RANGE = (6.5, 8.2)        # per-env battery voltage DR in training
 BAM_VIN_DROP_GAIN_RANGE = (0.0, 0.2)  # load-dependent sag V_drop = gain * sum|tau|
 BAM_VIN_MIN = 6.0                 # floor on effective voltage after sag
+SELFTEST_MID    = 0.0875   # 坐/站分界高度(m)：坐姿约 0.060，站立约 0.115
+SELFTEST_SETTLE = 10.0     # 每次切换后等多久(s)
+SELFTEST_GAP    = 3.0      # 两次切换之间间隔(s)
 BAM_MAX_CURRENT = None            # training runs WITHOUT the firmware current limiter
 # Stiff joint-friction constraint, copied from bam.mjlab.BamActuator
 # (stiff_frictionloss=True in training): warp has no noslip solver, so BAM
@@ -142,6 +162,9 @@ DEFAULT_POSE = np.array([
 
 class TerminalInput:
     """Single-keypress reader on stdin (cbreak mode, background thread).
+    Cross-platform: Linux/macOS uses termios/select, Windows uses msvcrt.
+    Falls back to disabled (no-ops) when stdin isn't a TTY or the platform
+    library is missing.
 
     Replaces the MuJoCo viewer key_callback: keypresses in the viewer window
     also fire the viewer's built-in visualization shortcuts (frames, labels,
@@ -155,17 +178,24 @@ class TerminalInput:
 
     def __init__(self):
         self._queue = queue.Queue()
-        self.enabled = sys.stdin.isatty()
+        self.enabled = sys.stdin.isatty() and _HAS_TTY_LIBS
         self._fd = sys.stdin.fileno() if self.enabled else -1
         self._old_attrs = None
         self._stop = threading.Event()
 
     def __enter__(self):
         if not self.enabled:
-            print("WARNING: stdin is not a TTY — keyboard control disabled")
+            if not sys.stdin.isatty():
+                print("WARNING: stdin is not a TTY — keyboard control disabled")
+            else:
+                print("WARNING: TTY libs unavailable — keyboard control disabled")
             return self
-        self._old_attrs = termios.tcgetattr(self._fd)
-        tty.setcbreak(self._fd)
+        if _IS_WINDOWS:
+            # Windows msvcrt: no terminal attribute setup needed
+            pass
+        else:
+            self._old_attrs = termios.tcgetattr(self._fd)
+            tty.setcbreak(self._fd)
         threading.Thread(target=self._reader, daemon=True).start()
         return self
 
@@ -174,10 +204,7 @@ class TerminalInput:
         if self._old_attrs is not None:
             termios.tcsetattr(self._fd, termios.TCSADRAIN, self._old_attrs)
 
-    def _read1(self, timeout):
-        """Read one byte from stdin, or None on timeout. os.read (unbuffered):
-        buffered sys.stdin.read would swallow escape-sequence bytes past what
-        select reported ready."""
+    def _read1_posix(self, timeout: float):
         r, _, _ = select.select([self._fd], [], [], timeout)
         if not r:
             return None
@@ -185,18 +212,37 @@ class TerminalInput:
         return data.decode(errors="ignore") if data else None
 
     def _reader(self):
-        while not self._stop.is_set():
-            ch = self._read1(0.1)
-            if not ch:
-                continue
-            if ch == "\x1b":  # possible arrow-key escape sequence
-                if self._read1(0.05) == "[":
-                    final = self._read1(0.05)
-                    name = self._ARROWS.get(final) if final else None
+        if _IS_WINDOWS:
+            # ---------------- Windows msvcrt reader ----------------
+            while not self._stop.is_set():
+                if not msvcrt.kbhit():
+                    time.sleep(0.05)
+                    continue
+                ch = msvcrt.getwch()
+                # msvcrt arrow keys: first char is \xe0 or \x00, second is letter
+                if ch in ("\xe0", "\x00"):
+                    code = msvcrt.getwch()
+                    # Windows arrow codes: H=up, P=down, M=right, K=left
+                    mapping = {"H": "up", "P": "down", "M": "right", "K": "left"}
+                    name = mapping.get(code)
                     if name:
                         self._queue.put(name)
-                continue  # bare ESC / unknown sequence: ignore
-            self._queue.put(ch.lower() if ch.isalpha() else ch)
+                    continue
+                self._queue.put(ch.lower() if ch.isalpha() else ch)
+        else:
+            # ---------------- POSIX (Linux/macOS) reader ----------------
+            while not self._stop.is_set():
+                ch = self._read1_posix(0.1)
+                if not ch:
+                    continue
+                if ch == "\x1b":  # possible arrow-key escape sequence
+                    if self._read1_posix(0.05) == "[":
+                        final = self._read1_posix(0.05)
+                        name = self._ARROWS.get(final) if final else None
+                        if name:
+                            self._queue.put(name)
+                    continue  # bare ESC / unknown sequence: ignore
+                self._queue.put(ch.lower() if ch.isalpha() else ch)
 
     def get_keys(self):
         """Drain and return all pending keys (symbolic names / characters)."""
@@ -217,7 +263,8 @@ class PolicyInference:
                  sitstand_onnx_path=None,
                  kick_left_onnx_path=None, kick_right_onnx_path=None,
                  roulade_onnx_path=None,
-                 kick_duration=3.0, roulade_duration=2.0):
+                 dance_onnx_path=None,
+                 kick_duration=3.0, roulade_duration=2.0, dance_duration=2.0):
         self.bam_ctrl = bam_ctrl  # bam.mujoco.MujocoController (None = legacy position actuators)
         self.model = model
         self.data = data
@@ -324,6 +371,7 @@ class PolicyInference:
             ("kick_left", kick_left_onnx_path, kick_duration),
             ("kick_right", kick_right_onnx_path, kick_duration),
             ("roulade", roulade_onnx_path, roulade_duration),
+            ("dance", dance_onnx_path, dance_duration),
         ):
             if not path:
                 continue
@@ -893,6 +941,262 @@ class PolicyInference:
             self.data.ctrl[:] = target_positions
 
 
+class MqttCommandSubscriber(threading.Thread):
+    """MQTT 命令订阅线程：监听主题，解析 op，调用 policy 的对应方法。
+
+    协议（topic: microduck/robot01/cmd）::
+
+        {
+          "msg_id":   "cmd-...",   // 命令唯一ID，双通路ack用
+          "robot_id": "robot01",   // 机器人编号
+          "op":       "walk_forward",
+          "params":   { "vx": 0.2, ... },
+          "timestamp": 1734567890123
+        }
+
+    op 枚举（与 manifest.py SLOTS / robotctl 指令命名风格对齐，snake_case）：
+        walk_forward, walk_backward, turn_left, turn_right, stop,
+        toggle_sitstand, kick_left, kick_right, roulade, ground_pick, switch_mode
+    """
+
+    def __init__(
+        self,
+        policy: "PolicyInference",
+        broker: str,
+        port: int,
+        topic: str,
+        user: str | None = None,
+        pwd: str | None = None,
+    ) -> None:
+        super().__init__(daemon=True)
+        self.policy = policy
+        self.broker = broker
+        self.port = port
+        self.topic = topic
+        self.user = user
+        self.pwd = pwd
+        self._stop = threading.Event()
+
+        # ---------- 上行（ACK + 遥测）相关 ----------
+        # 由命令主题推出上行主题
+        _base = topic.rsplit("/", 1)[0]
+        self.ack_topic = _base + "/ack"
+        self.tlm_topic = _base + "/telemetry"
+        self.tlm_hz = 50.0                      # 遥测频率Hz
+        self._client = None                     # run() 里赋值
+        self._tlm_started = threading.Event()   # 防止断线重连重复起线程
+        self._current_op = "idle"               # 当前动作
+
+    # ---------- 字段/别名归一化：兼容 Zhu Jiaheng 后端当前简化版 + TEAM_MQTT_PROTOCOL.md 完整版 ----------
+    # 常见写法别名（snake_case、去中划线、去空格都在 _normalize 里做，这里补常见口语词）
+    _OP_ALIASES: dict[str, str] = {
+        # 步行/速度
+        "forward": "walk_forward", "forwards": "walk_forward", "walk forward": "walk_forward",
+        "go": "walk_forward", "go_forward": "walk_forward", "walk_fwd": "walk_forward",
+        "backward": "walk_backward", "backwards": "walk_backward", "walk backward": "walk_backward",
+        "go_back": "walk_backward", "walk_bwd": "walk_backward", "back": "walk_backward",
+        "left": "turn_left", "turn left": "turn_left", "rotate_left": "turn_left",
+        "right": "turn_right", "turn right": "turn_right", "rotate_right": "turn_right",
+        "stop": "stop", "halt": "stop", "idle": "stop",
+        # 蹲站切换（常见别名）
+        "sit": "toggle_sitstand", "stand": "toggle_sitstand",
+        "sit_stand": "toggle_sitstand", "sit/stand": "toggle_sitstand",
+        "crouch": "toggle_sitstand", "crouch_stand": "toggle_sitstand",
+        "toggle_sit": "toggle_sitstand", "toggle_stand": "toggle_sitstand",
+        # 踢球
+        "kick": "kick_left", "kickleft": "kick_left", "kick_left": "kick_left",
+        "kick_left_foot": "kick_left", "left_kick": "kick_left",
+        "kickright": "kick_right", "kick_right": "kick_right",
+        "kick_right_foot": "kick_right", "right_kick": "kick_right",
+        # 预留动作
+        "roll": "roulade", "forward_roll": "roulade", "somersault": "roulade",
+        "pick": "ground_pick", "pickup": "ground_pick", "ground_pickup": "ground_pick",
+        "pick_up": "ground_pick", "grab": "ground_pick",
+        # 模式切换
+        "mode": "switch_mode", "switch": "switch_mode", "change_mode": "switch_mode",
+        "toggle_mode": "switch_mode", "roller": "switch_mode", "walk": "switch_mode",
+    }
+
+    @classmethod
+    def _normalize(cls, data: dict) -> tuple[str | None, dict, str]:
+        """字段级联查找 + 别名归一化：Zhu 后端当前 {action,command_id} → 标准 (op, params, msg_id)"""
+        # 1) op: op > action > cmd > skill（4 个候选字段级联查）
+        raw = (
+            data.get("op")
+            or data.get("action")
+            or data.get("cmd")
+            or data.get("skill")
+            or None
+        )
+        raw_clean: str | None = None
+        if isinstance(raw, str):
+            raw_clean = raw.strip().lower().replace("-", "_").replace(" ", "_")
+        op = cls._OP_ALIASES.get(raw_clean, raw_clean) if raw_clean else None
+
+        # 2) params: params 没有就用空 dict，永远给 dict 类型
+        params = data.get("params")
+        if not isinstance(params, dict):
+            params = {}
+
+        # 3) msg_id: msg_id > command_id > id > 自动生成（毫秒时间戳）
+        msg_id = str(
+            data.get("msg_id")
+            or data.get("command_id")
+            or data.get("id")
+            or f"auto-{int(__import__('time').time() * 1000)}"
+        )
+        return op, params, msg_id
+    def _send_ack(self, msg_id: str, phase: str, result: str | None = None) -> None:
+        """向上游回传命令执行阶段：received / started / finished"""
+        if self._client is None:
+            return
+        payload = {
+            "msg_id": msg_id,
+            "robot_id": self.topic.split("/")[1],
+            "phase": phase,
+            "result": result,
+            "ts": int(time.time() * 1000),
+        }
+        self._client.publish(self.ack_topic, json.dumps(payload), qos=1)
+        print(f"[ACK] {msg_id} phase={phase} result={result}", flush=True)
+
+    def _telemetry_loop(self) -> None:
+        """按固定频率发布遥测。
+
+        用「累加目标时刻」而不是「累加实际耗时」：
+        若写成 time.sleep(1/hz)，循环体自身的耗时会被叠加进去，
+        跑一分钟就会明显偏离目标频率。
+        """
+        period = 1.0 / self.tlm_hz
+        next_t = time.perf_counter()
+        while not self._stop.is_set():
+            next_t += period
+
+            snap = getattr(self.policy, "_tlm_snapshot", None)
+            joints = {}
+            trunk_z = None
+            if snap is not None:
+                trunk_z = round(float(snap[2]), 4)
+                for i in range(6):
+                    joints[f"joint{i + 1}"] = round(float(snap[7 + i]), 4)
+
+            payload = {
+                "robot_id": self.topic.split("/")[1],
+                "ts": int(time.time() * 1000),
+                "policy": self._current_op,
+                "trunk_z": trunk_z,
+                "joints": joints,
+            }
+            if self._client is not None:
+                self._client.publish(self.tlm_topic, json.dumps(payload), qos=0)
+
+            delay = next_t - time.perf_counter()
+            if delay > 0:
+                time.sleep(delay)
+            else:
+                next_t = time.perf_counter()
+
+    def run(self) -> None:
+        import json
+
+        try:
+            import paho.mqtt.client as mqtt
+        except ImportError:
+            print("[MQTT] paho-mqtt not installed. Run `uv sync` to add it.")
+            return
+
+        def on_connect(client, _userdata, _flags, rc, _props=None):
+            if rc == 0:
+                print(f"[MQTT] Connected to {self.broker}:{self.port}, subscribing {self.topic}")
+                client.subscribe(self.topic)
+                # 关闭 Nagle 算法：否则会与 TCP 延迟 ACK 叠加出约 40ms 的随机延迟
+                try:
+                    client.socket().setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                    print("[MQTT] TCP_NODELAY enabled")
+                except Exception as e:
+                    print(f"[MQTT] TCP_NODELAY failed: {e}")
+                # 只在第一次连接时启动遥测线程
+                # on_connect 断线重连会再次触发
+                if not self._tlm_started.is_set():
+                    self._tlm_started.set()
+                    threading.Thread(target=self._telemetry_loop, daemon=True).start()
+                    print(f"[TLM] telemetry thread started @ {self.tlm_hz} Hz -> {self.tlm_topic}")
+            else:
+                print(f"[MQTT] connect failed rc={rc}")
+
+
+        def on_message(_client, _userdata, msg):
+            try:
+                data = json.loads(msg.payload.decode())
+            except Exception as e:
+                print(f"[MQTT] bad JSON ({e}): {msg.payload[:100]}")
+                return
+            op, params, msg_id = self._normalize(data)
+            self._dispatch(op, params, msg_id)
+
+        client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
+        if self.user:
+            client.username_pw_set(self.user, self.pwd)
+        self._client = client
+        client.on_connect = on_connect
+        client.on_message = on_message
+        try:
+            client.connect(self.broker, self.port, keepalive=60)
+        except Exception as e:
+            print(f"[MQTT] connect exception: {e}")
+            return
+        while not self._stop.is_set():
+            client.loop(timeout=0.05)
+        try:
+            client.disconnect()
+        except Exception:
+            pass
+
+    def _dispatch(self, op: str | None, params: dict, msg_id: str) -> None:
+        print(f"[MQTT] cmd op={op} msg_id={msg_id} params={params}")
+        self._send_ack(msg_id, "received")
+        if op is None:
+            self._send_ack(msg_id, "finished", result="fail")
+            return
+
+        if op == "walk_forward":
+            vx = float(params.get("vx", 0.3))
+            self.policy.set_vel_cmd(vx, 0.0, 0.0)
+        elif op == "walk_backward":
+            vx = float(params.get("vx", -0.4))
+            self.policy.set_vel_cmd(vx, 0.0, 0.0)
+        elif op == "turn_left":
+            wz = float(params.get("wz", 1.0))
+            self.policy.set_vel_cmd(0.0, 0.0, wz)
+        elif op == "turn_right":
+            wz = float(params.get("wz", -1.0))
+            self.policy.set_vel_cmd(0.0, 0.0, wz)
+        elif op == "stop":
+            self.policy.set_vel_cmd(0.0, 0.0, 0.0)
+        elif op == "toggle_sitstand":
+            self.policy.toggle_sit()
+        elif op == "kick_left":
+            self.policy.trigger_behavior("kick_left")
+        elif op == "kick_right":
+            self.policy.trigger_behavior("kick_right")
+        elif op == "roulade":
+            self.policy.trigger_behavior("roulade")
+        elif op == "dance":
+            self.policy.trigger_behavior("dance")
+        elif op == "ground_pick":
+            self.policy.trigger_ground_pick()
+        elif op == "switch_mode":
+            mode = params.get("mode", "walk")
+            print(f"[MQTT] switch_mode request: {mode}. NOTE: mode cannot be hot-swapped — "
+                  "restart the process with --roller (roller model) or without it (walking model).")
+        else:
+            print(f"[MQTT] unknown op: {op}")
+
+        self._send_ack(msg_id, "started")
+        self._send_ack(msg_id, "finished", result="ok")
+        self._current_op = op if op else "idle"
+
+
 def main():
     parser = argparse.ArgumentParser(description="Run ONNX policy in MuJoCo")
     parser.add_argument("--roller", action="store_true", help="Use roller skate robot XML (robot_walk_rollers.xml)")
@@ -906,6 +1210,8 @@ def main():
     parser.add_argument("--kick-left", type=str, default=None, help="Path to LEFT-foot ball kick policy ONNX (press K to trigger). Requires --new-cmd-obs. Loads a scene with a ball.")
     parser.add_argument("--kick-right", type=str, default=None, help="Path to RIGHT-foot ball kick policy ONNX (press L to trigger). Requires --new-cmd-obs. Loads a scene with a ball.")
     parser.add_argument("--roulade", type=str, default=None, help="Path to roulade (forward roll) policy ONNX (press R to trigger). Requires --new-cmd-obs.")
+    parser.add_argument("--dance", type=str, default=None, help="Path to dance policy ONNX (press D to trigger). Requires --new-cmd-obs.")
+    parser.add_argument("--dance-duration", type=float, default=2.0, help="Seconds the dance policy stays active (default: 10.0)")
     parser.add_argument("--kick-duration", type=float, default=3.0, help="Seconds a kick policy stays active before handing back to standing/walking (default: 3.0)")
     parser.add_argument("--roulade-duration", type=float, default=2.0, help="Seconds the roulade policy stays active before handing back to standing/walking (default: 2.0, ~the roll itself; the standing/walking policy takes over for the settle)")
     parser.add_argument("--lin-vel-x", type=float, default=0.0, help="Initial linear velocity X command (m/s)")
@@ -915,6 +1221,8 @@ def main():
     parser.add_argument("--raw-accelerometer", action="store_true", help="Use raw accelerometer instead of projected gravity")
     parser.add_argument("--delay", type=int, nargs='*', default=None, help="Enable actuator delay: --delay MIN MAX or --delay LAG")
     parser.add_argument("--debug", action="store_true", help="Print observations and actions")
+    parser.add_argument("--selftest", type=int, default=0,
+                        help="自动做 N 轮坐立切换并统计成功率（0 = 关闭）。需要 --sitstand")
     parser.add_argument("--save-csv", type=str, default=None, help="Save observations and actions to CSV file")
     parser.add_argument("--record", type=str, default=None, help="Enable recording mode: save observations to pickle file on Ctrl+C")
     parser.add_argument("--switch-threshold", type=float, default=0.05, help="Vel command magnitude threshold for walking/standing switch (default: 0.05)")
@@ -947,16 +1255,28 @@ def main():
                         help="Soften foot contact: solref time constant (s) for the foot geoms "
                              "(default sim ~0.02 = stiff/rigid). Larger = softer, to emulate the "
                              "compliant PU sole. e.g. --foot-solref 0.04")
+    parser.add_argument("--enable-mqtt", action="store_true",
+                        help="启用 MQTT 命令订阅（网页 → EMQX → 模拟机器人 遥操作链路）")
+    parser.add_argument("--mqtt-broker", type=str, default="test.mosquitto.org",
+                        help="MQTT Broker 地址（默认公开测试 broker: test.mosquitto.org）")
+    parser.add_argument("--mqtt-port", type=int, default=1883,
+                        help="MQTT Broker 端口（默认 1883）")
+    parser.add_argument("--mqtt-topic", type=str, default="microduck/robot01/cmd",
+                        help="MQTT 命令主题（默认 microduck/robot01/cmd）")
+    parser.add_argument("--mqtt-user", type=str, default=None,
+                        help="MQTT 用户名（Broker 需要鉴权时使用）")
+    parser.add_argument("--mqtt-pass", type=str, default=None,
+                        help="MQTT 密码（Broker 需要鉴权时使用）")
     args = parser.parse_args()
 
     if not args.walking and not args.standing and not args.sitstand:
         parser.error("At least one of --walking, --standing or --sitstand must be provided")
     if args.sitstand and not args.new_cmd_obs:
         parser.error("--sitstand policies use the unified 13D command obs (61D); add --new-cmd-obs")
-    if (args.kick_left or args.kick_right or args.roulade) and not args.new_cmd_obs:
-        parser.error("--kick-left/--kick-right/--roulade policies use the unified 13D command obs (61D); add --new-cmd-obs")
-    if (args.kick_left or args.kick_right or args.roulade) and args.roller:
-        parser.error("kick/roulade policies are trained on the walking robot, not the roller model")
+    if (args.kick_left or args.kick_right or args.roulade or args.dance) and not args.new_cmd_obs:
+        parser.error("--kick-left/--kick-right/--roulade/ --dance policies use the unified 13D command obs (61D); add --new-cmd-obs")
+    if (args.kick_left or args.kick_right or args.roulade or args.dance) and args.roller:
+        parser.error("kick/roulade/dance policies are trained on the walking robot, not the roller model")
 
     # Parse delay arguments
     delay_min_lag = 0
@@ -1057,8 +1377,10 @@ def main():
         kick_left_onnx_path=args.kick_left,
         kick_right_onnx_path=args.kick_right,
         roulade_onnx_path=args.roulade,
+        dance_onnx_path=args.dance,
         kick_duration=args.kick_duration,
         roulade_duration=args.roulade_duration,
+        dance_duration=args.dance_duration,
     )
     policy.set_vel_cmd(args.lin_vel_x, args.lin_vel_y, args.ang_vel_z)
 
@@ -1138,13 +1460,28 @@ def main():
         print(f"{kind} policy: loaded  (press Y to toggle)")
     if policy.slope_session:
         print(f"Slope policy: loaded  (press Y to toggle, passive descent)")
-    _behavior_keys = {"kick_left": "K", "kick_right": "L", "roulade": "R"}
+    _behavior_keys = {"kick_left": "K", "kick_right": "L", "roulade": "R", "dance": "D"}
     for _name in policy.behavior_sessions:
         print(f"{_name} policy: loaded  (press {_behavior_keys[_name]}, "
               f"auto-return after {policy.behavior_durations[_name]:.1f}s)")
     print(f"Active policy: {policy.current_policy}")
     print("Close viewer window to exit")
     print()
+
+    # ========== MQTT 命令订阅线程（--enable-mqtt 时启动） ==========
+    if args.enable_mqtt:
+        mqtt_thread = MqttCommandSubscriber(
+            policy,
+            broker=args.mqtt_broker,
+            port=args.mqtt_port,
+            topic=args.mqtt_topic,
+            user=args.mqtt_user,
+            pwd=args.mqtt_pass,
+        )
+        mqtt_thread.start()
+        print(f"[MQTT] 已启动订阅线程. broker={args.mqtt_broker}:{args.mqtt_port} topic={args.mqtt_topic}")
+        print(f"[MQTT] 发送 JSON 示例：{{\"msg_id\":\"1\",\"op\":\"walk_forward\",\"params\":{{\"vx\":0.2}}}}")
+        print()
 
     decimation = 4
     control_step_count = 0
@@ -1274,6 +1611,8 @@ def main():
                 policy.trigger_behavior("kick_right")
             elif key == "r":
                 policy.trigger_behavior("roulade")
+            elif key == "d":
+                policy.trigger_behavior("dance")
             elif key == "q":
                 quit_requested = True
                 print("Quit requested")
@@ -1341,6 +1680,7 @@ def main():
     print("  K:                kick with LEFT foot (requires --kick-left)")
     print("  L:                kick with RIGHT foot (requires --kick-right)")
     print("  R:                roulade / forward roll (requires --roulade)")
+    print("  D:                dance (requires --dance)")
     print(f"  P:                random push (trunk vel = {PUSH_MAX:.1f} m/s in random direction)")
     print("  Q:                quit")
     print("  [ Body pose mode — press B to toggle ]")
@@ -1371,11 +1711,48 @@ def main():
         try:
             prev_step_time = time.time()
 
+            # ---- 坐立自测模式 ----
+            st_n = args.selftest
+            st_i = 0
+            st_stage = 0
+            st_next = time.time() + 6.0
+            st_want_sit = False
+            st_ok = 0
+
             while viewer.is_running() and not quit_requested:
                 step_start = time.time()
 
                 for key in term.get_keys():
                     handle_key(key)
+
+                if st_n > 0:
+                    _z = float(data.qpos[qpos_adr + 2])
+                    if st_stage == 0 and time.time() >= st_next:
+                        policy.sit_mode = (_z < SELFTEST_MID)
+                        policy._update_command()
+                        st_want_sit = not policy.sit_mode
+                        policy.toggle_sit()
+                        st_i += 1
+                        print(f"[SELFTEST] {st_i}/{st_n}  切换前 z={_z * 1000:.1f} mm"
+                              f"  -> 期望{'坐' if st_want_sit else '站'}", flush=True)
+                        st_stage = 1
+                        st_next = time.time() + SELFTEST_SETTLE
+                    elif st_stage == 1 and time.time() >= st_next:
+                        _z2 = float(data.qpos[qpos_adr + 2])
+                        _ok = (_z2 < SELFTEST_MID) if st_want_sit else (_z2 > SELFTEST_MID)
+                        if _ok:
+                            st_ok += 1
+                        print(f"[SELFTEST] {st_i}/{st_n}  切换后 z={_z2 * 1000:.1f} mm"
+                              f"  -> {'成功' if _ok else '失败'}"
+                              f"   （累计 {st_ok}/{st_i}）", flush=True)
+                        st_stage = 0
+                        st_next = time.time() + SELFTEST_GAP
+                        if st_i >= st_n:
+                            print("=" * 52, flush=True)
+                            print(f"[SELFTEST] 完成：成功率 {st_ok}/{st_i}"
+                                  f" = {100.0 * st_ok / st_i:.1f}%", flush=True)
+                            print("=" * 52, flush=True)
+                            st_n = 0
 
                 if not policy_enabled and policy_enable_time is not None:
                     if step_start >= policy_enable_time:

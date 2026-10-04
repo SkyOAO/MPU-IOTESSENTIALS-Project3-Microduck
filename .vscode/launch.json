@@ -1,0 +1,28 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "infer_policy",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/scripts/infer_policy.py",
+      "cwd": "${workspaceFolder}",
+      "python": "${workspaceFolder}/.venv/bin/python",
+      "console": "integratedTerminal",
+      "env": { "PYTHONUNBUFFERED": "1" },
+      "args": [
+        "--walking",  "onnx/alpha_walking.onnx",
+        "--standing", "onnx/alpha_walking.onnx",
+        "--sitstand", "onnx/alpha_sitstand.onnx",
+        "--dance",    "onnx/dance.onnx",
+        "--new-cmd-obs",
+        "--enable-mqtt",
+        "--mqtt-broker", "8.138.114.112",
+        "--mqtt-port",   "1883",
+        "--mqtt-user",   "microduck",
+        "--mqtt-pass",   "MicroDuck@Mqtt2026",
+        "--vin",         "8.2"
+      ]
+    }
+  ]
+}
