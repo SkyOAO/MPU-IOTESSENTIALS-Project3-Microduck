@@ -5264,10 +5264,12 @@ def dance_step_tracking(
     walk_end: float,
     n_steps: int,
     amplitude: float,
+    threshold_min: float = 0.125,
+    threshold_max: float = 0.300,
     lean_frac: float = 0.3,
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
-    """The scheduled foot is the one OFF the ground; the other is not graded.
+    """The scheduled foot held OFF the ground for 0.125-0.3 s; the other is not graded.
 
     This is the timing half of the gait, and it is the ONLY foot-lift reward:
     `foot_clearance` and `foot_swing_height` shape how high the swing gets, but
@@ -5283,35 +5285,38 @@ def dance_step_tracking(
     and it was therefore free money: a 1000-iteration run kept one foot airborne
     for 89 % of the stand instead of standing on it.
 
-    The lift only pays while the trunk is leaning the way that phase asks,
-    ``roll * reference >= lean_frac * reference ** 2``. At ``lean_frac`` 0.0 that
-    is a pure SIGN test, and it has to be: a foot is only unloaded by leaning over
-    the other one, so a lift payment that also demands a formed lean locks the two
-    together and neither is ever discovered. Measured at 0.3, ``dance_sway_l1``
-    sat pinned at its no-roll value from iteration 250 to 800 — the trunk never
-    rolled at all. The sign test is still not free: stepping with the trunk
-    leaning the wrong way pays nothing, so the sway cannot be farmed by a level
-    shuffle (a 1000-iteration run at much looser gating did exactly that, twisting
-    its hips +/-17 deg for 80 deg of yaw drift, which is why the magnitude test
-    was added) — it is traded for reachability, and leaning further is what
-    collects the rest of the term.
+    The DURATION is the load-bearing part of the term. A foot can only stay off
+    the ground if the weight is on the other one, and unloading that one takes
+    about 8 deg of trunk lean (the stance foot's inner edge is 21 mm off the
+    centreline with the CoM 148 mm up). So "a foot held up for 0.2 s" and "the
+    trunk is leaning" are the same statement, and paying on it is what forces the
+    sway to exist at all. Paying for ``air_time > 0`` instead — any touch-and-go
+    hop — pays for a lift taken with a level trunk, and that is what a
+    1000-iteration run took: ``dance_sway_l1`` pinned at its no-roll value (10.2
+    deg of mean tracking error) for 300 iterations while the trunk never rolled
+    once, even after the lean gate below was opened all the way to a sign test.
+
+    ``lean_frac`` is the bootstrap on top of that, and it has to be loose: a lift
+    payment that ALSO demands a formed lean locks the lift and the lean together
+    and neither is ever discovered (measured at 0.3: no roll at all over 550
+    iterations). At 0.0 it is a pure SIGN test — ``roll * reference >= 0`` — so a
+    level but noisy trunk collects about half and leaning in the right direction
+    collects the rest. Leaning the WRONG way still pays nothing, so the sway
+    cannot be farmed by a shuffle; what is lost versus the magnitude test is only
+    the guarantee against a hip-twist (the 1000-iteration run that twisted its
+    hips +/-17 deg for 80 deg of yaw drift), and the duration window above is what
+    makes that trade affordable.
     """
     asset: Entity = env.scene[asset_cfg.name]
     local = dance_local_phase(_dance_command(env, command_name), rep_end)
     schedule = dance_step_schedule(local, walk_end, n_steps)
     air_time = env.scene[sensor_name].data.current_air_time
     assert air_time is not None, f"Sensor '{sensor_name}' has no air-time field."
-    airborne = torch.stack(
-        (
-            (air_time[:, 0] > 0.0).to(torch.float32),
-            (air_time[:, 1] > 0.0).to(torch.float32),
-        ),
-        dim=-1,
-    )
+    held_up = ((air_time > threshold_min) & (air_time < threshold_max)).to(torch.float32)
     reference = dance_sway_reference(local, walk_end, n_steps, amplitude)
     roll = _dance_trunk_roll(asset)
     leaning = (roll * reference >= lean_frac * reference ** 2).to(torch.float32).unsqueeze(-1)
-    return (schedule * airborne * leaning).sum(dim=-1)
+    return (schedule * held_up * leaning).sum(dim=-1)
 
 
 def dance_forward_progress(

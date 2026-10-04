@@ -333,9 +333,24 @@ def _step(env):
     ).item()
 
 
+def test_the_lift_only_pays_while_the_foot_is_held_up_long_enough():
+    """The 0.125-0.3 s window is the load-bearing part of the term: a foot cannot
+    STAY off the ground unless the weight is on the other one, which takes ~8 deg
+    of trunk lean. Paying for any touch-and-go hop instead paid for a lift with a
+    level trunk, and the trunk then never rolled at all."""
+    at_peak = _sway_local(0.25)  # right foot's half-cycle
+
+    def _score(air):
+        return _step(_dance_env(at_peak, air_time=torch.tensor([[0.0, air]])))
+
+    assert _score(0.20) == pytest.approx(1.0)   # held up inside the window
+    assert _score(0.05) == 0.0                  # too brief: a hop, not a step
+    assert _score(0.35) == 0.0                  # too long: a stall, not a step
+
+
 def test_step_tracking_needs_the_schedule_and_the_lift():
     # At a swing zero-crossing the reference is 0, so the lean test is vacuous
-    # there and a scheduled airborne foot is simply a step.
+    # there and a scheduled foot held up for the window is simply a step.
     env = _dance_env(0.0, air_time=torch.tensor([[0.0, 0.2]]))
     assert _step(env) == pytest.approx(1.0)
     # ... and the WRONG foot being up is not a step either
@@ -451,7 +466,7 @@ def test_the_routine_terms_are_registered():
         "dance_sway_l1": 2.0,
         "dance_step_tracking": 3.0,
         "dance_forward_progress": 0.0,  # ramped by the forward_progress_weight curriculum
-        "dance_heading_l1": 3.0,
+        "dance_heading_l1": 1.0,
         "dance_pitch_balance": 4.0,
         "dance_head_hold": 0.4,
     }

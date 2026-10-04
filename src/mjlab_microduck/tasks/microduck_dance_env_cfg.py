@@ -410,10 +410,12 @@ def make_microduck_dance_env_cfg(
         params={**step_params, "amplitude": DANCE_SWAY_AMPLITUDE},
     )
 
-    # Which foot is up, for the whole walk. A lift only pays while the trunk is
-    # leaning the way that step asks (`lean_frac` of the reference), which is what
-    # stops the sway from being farmed by stepping on a level trunk — that was the
-    # 1000-iteration run whose hips twisted instead of leaning.
+    # Which foot is up, for how long, and leaning which way. The 0.125-0.3 s
+    # window is the load-bearing part: a foot cannot stay off the ground without
+    # ~8 deg of trunk lean over the stance foot, so a lift payment that requires
+    # DURATION is what makes the sway happen at all. `lean_frac` on top of it is
+    # the loose bootstrap; see the docstring for why it cannot demand a formed
+    # lean. Stands in for the stock `air_time`, which could not be window-gated.
     cfg.rewards["dance_step_tracking"] = RewardTermCfg(
         func=microduck_mdp.dance_step_tracking,
         weight=3.0,
@@ -421,6 +423,8 @@ def make_microduck_dance_env_cfg(
             **step_params,
             "sensor_name": feet_ground_cfg.name,
             "amplitude": DANCE_SWAY_AMPLITUDE,
+            "threshold_min": 0.125,
+            "threshold_max": 0.300,
             "lean_frac": DANCE_LEAN_FRAC,
         },
     )
@@ -435,11 +439,13 @@ def make_microduck_dance_env_cfg(
     # readily by shifting the weight side to side, so without this the routine
     # visibly curves: a 1000-iteration run ended 52° off its spawn heading
     # (≤ 0 → POSITIVE weight). L1, so oscillation cancels and only the heading
-    # error itself is charged. 3.0 rather than the bounce's 1.0: at 1.0 the same
-    # run measured a 32° mean error, i.e. the term was not enforcing anything.
+    # error itself is charged. Back to 1.0: at 3.0 the same drift was still 45°
+    # — the term was not winning — while it taxed the sway, which turns the robot
+    # by construction. Straightening the walk needs a different mechanism, and
+    # that comes after the sway exists.
     cfg.rewards["dance_heading_l1"] = RewardTermCfg(
         func=microduck_mdp.dance_heading_l1,
-        weight=3.0,
+        weight=1.0,
         params={"command_name": "twist"},
     )
 
