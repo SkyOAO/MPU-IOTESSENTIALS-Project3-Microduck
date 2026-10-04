@@ -136,17 +136,13 @@ DANCE_START_PHASE_PROB = 0.35
 DANCE_SWAY_DEG = 15.0
 DANCE_SWAY_AMPLITUDE = math.radians(DANCE_SWAY_DEG)
 
-# How far into the commanded lean a lift has to be before it pays, as a fraction
-# of the reference. 0.0 = only the SIGN has to match (`roll * ref >= 0`), and
-# that sign test is the ladder the whole gait hangs off: a foot can only be
-# unloaded by leaning over the other one, so a lift payment that ALSO demands a
-# formed lean locks the two together and neither is ever discovered. At 0.3 that
-# is exactly what happened — a run measured `dance_sway_l1` pinned at its no-roll
-# value (10.0 deg of mean tracking error) from iteration 250 to 800, i.e. the
-# trunk never rolled once. At 0.0 a level but noisy trunk collects about half and
-# a correctly-leaning one collects all, so the lift is teachable first and the
-# lean is still the only way to collect the other half.
-DANCE_LEAN_FRAC = 0.0
+# How far into the commanded lean a lift has to be before `dance_step_tracking`
+# pays, as a fraction of the reference. The sustained lift that the sway is made
+# of is taught by `air_time` (see below), NOT by this — this is only the guard
+# that stops the sway being farmed by stepping with a level trunk. Do not tighten
+# it to carry the sway on its own: demanding a formed lean from the lift payment
+# locks the lift and the lean together and neither is ever discovered.
+DANCE_LEAN_FRAC = 0.3
 
 # The speed the walk is asked to hold, in m/s. Not a distance: the routine is
 # speed-commanded, so the ground covered is this times WALK_S (0.10 m/s over 4 s
@@ -407,12 +403,9 @@ def make_microduck_dance_env_cfg(
         params={**step_params, "amplitude": DANCE_SWAY_AMPLITUDE},
     )
 
-    # Which foot is up, for how long, and leaning which way. The 0.125-0.3 s
-    # window is the load-bearing part: a foot cannot stay off the ground without
-    # ~8 deg of trunk lean over the stance foot, so a lift payment that requires
-    # DURATION is what makes the sway happen at all. `lean_frac` on top of it is
-    # the loose bootstrap; see the docstring for why it cannot demand a formed
-    # lean. Stands in for the stock `air_time`, which could not be window-gated.
+    # Which foot is up, and leaning which way. The sustained lift that the sway is
+    # made of is `air_time`'s job (below); this term only adds the timing and the
+    # guard against farming a lift with a level trunk.
     cfg.rewards["dance_step_tracking"] = RewardTermCfg(
         func=microduck_mdp.dance_step_tracking,
         weight=3.0,
@@ -420,8 +413,6 @@ def make_microduck_dance_env_cfg(
             **step_params,
             "sensor_name": feet_ground_cfg.name,
             "amplitude": DANCE_SWAY_AMPLITUDE,
-            "threshold_min": 0.125,
-            "threshold_max": 0.300,
             "lean_frac": DANCE_LEAN_FRAC,
         },
     )
@@ -478,18 +469,27 @@ def make_microduck_dance_env_cfg(
     # weight is the sway version's own.
     cfg.rewards["pose"].weight = 2.0
 
-    # Gait shaping straight from the velocity recipe, values and all:
-    # `foot_clearance` and `foot_swing_height` shape how high the swing gets,
-    # `foot_slip` damps scraping. Lift TIMING is `dance_step_tracking`'s job.
+    # Gait shaping straight from the velocity recipe, values and all: `air_time`
+    # pays for a foot held up 0.125-0.3 s, `foot_clearance` and `foot_swing_height`
+    # shape how high it gets, `foot_slip` damps scraping.
     #
-    # `air_time` is removed, not tuned. Its `command_threshold` gate can never
-    # close on a unit-circle phase (the command norm is always 1.0), so it stays
-    # armed in the closing stand, where every dance term is off and nothing else
-    # competes: a 1000-iteration run kept one foot airborne for 89 % of the stand
-    # and never stood at all, because lifting a foot there paid 3.0/step. Nothing
-    # needs to be added in its place — `dance_step_tracking` already schedules the
-    # lift, and the two foot-shape terms above still price the swing.
-    cfg.rewards.pop("air_time", None)
+    # `air_time` is the velocity recipe's own term REPLACED with a walk-windowed
+    # clone (`dance_air_time`) — same logic, same window, either foot. The stock
+    # one cannot be used as-is: its `command_threshold` gate can never close on a
+    # unit-circle phase, so it stays armed in the closing stand, where every dance
+    # term is off and nothing competes. A 1000-iteration run kept one foot airborne
+    # for 89 % of the stand and never stood at all, because lifting a foot there
+    # paid 3.0/step. Removing it instead is worse: this is the ladder that teaches
+    # a foot to stay up long enough to unload the other one, and without it the
+    # policy does not lift at all.
+    cfg.rewards["air_time"].func = microduck_mdp.dance_air_time
+    cfg.rewards["air_time"].weight = 3.0
+    cfg.rewards["air_time"].params = {
+        **walk_params,
+        "sensor_name": feet_ground_cfg.name,
+        "threshold_min": 0.125,
+        "threshold_max": 0.300,
+    }
     cfg.rewards["foot_clearance"].params["target_height"] = 0.02
     cfg.rewards["foot_swing_height"].params["target_height"] = 0.02
     for _term in ("foot_clearance", "foot_swing_height", "foot_slip"):

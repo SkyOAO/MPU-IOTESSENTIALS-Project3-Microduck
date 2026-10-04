@@ -5264,59 +5264,73 @@ def dance_step_tracking(
     walk_end: float,
     n_steps: int,
     amplitude: float,
-    threshold_min: float = 0.125,
-    threshold_max: float = 0.300,
     lean_frac: float = 0.3,
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
-    """The scheduled foot held OFF the ground for 0.125-0.3 s; the other is not graded.
+    """The scheduled foot is OFF the ground AND the trunk leans the way that step asks.
 
-    This is the timing half of the gait, and it is the ONLY foot-lift reward:
-    `foot_clearance` and `foot_swing_height` shape how high the swing gets, but
-    neither knows WHICH foot or WHEN. It is also what couples the lean to the
-    lift — leaning LEFT is scheduled at the same phase as the RIGHT foot being up
-    — so the step and the sway are one motion rather than two to be balanced
-    against each other.
+    This is the *timing* half of the gait: `foot_clearance` and `foot_swing_height`
+    shape how high the swing gets, but neither knows WHICH foot or WHEN. The
+    sustained-lift half is ``dance_air_time``, which is what actually teaches a
+    foot to stay up long enough to unload the other one.
 
-    The stock `feet_air_time` is NOT carried alongside it. Its ``command_threshold``
-    gate can never close here (the twist slot carries a unit-circle phase, so the
-    command norm is always 1.0), which made it an always-open payment for lifting
-    a foot — measured in the closing stand, where every other dance term is off
-    and it was therefore free money: a 1000-iteration run kept one foot airborne
-    for 89 % of the stand instead of standing on it.
-
-    The DURATION is the load-bearing part of the term. A foot can only stay off
-    the ground if the weight is on the other one, and unloading that one takes
-    about 8 deg of trunk lean (the stance foot's inner edge is 21 mm off the
-    centreline with the CoM 148 mm up). So "a foot held up for 0.2 s" and "the
-    trunk is leaning" are the same statement, and paying on it is what forces the
-    sway to exist at all. Paying for ``air_time > 0`` instead — any touch-and-go
-    hop — pays for a lift taken with a level trunk, and that is what a
-    1000-iteration run took: ``dance_sway_l1`` pinned at its no-roll value (10.2
-    deg of mean tracking error) for 300 iterations while the trunk never rolled
-    once, even after the lean gate below was opened all the way to a sign test.
-
-    ``lean_frac`` is the bootstrap on top of that, and it has to be loose: a lift
-    payment that ALSO demands a formed lean locks the lift and the lean together
-    and neither is ever discovered (measured at 0.3: no roll at all over 550
-    iterations). At 0.0 it is a pure SIGN test — ``roll * reference >= 0`` — so a
-    level but noisy trunk collects about half and leaning in the right direction
-    collects the rest. Leaning the WRONG way still pays nothing, so the sway
-    cannot be farmed by a shuffle; what is lost versus the magnitude test is only
-    the guarantee against a hip-twist (the 1000-iteration run that twisted its
-    hips +/-17 deg for 80 deg of yaw drift), and the duration window above is what
-    makes that trade affordable.
+    ``lean_frac`` requires the trunk to be at least that fraction of the way into
+    the commanded lean while the scheduled foot is up, which is what stops the
+    sway being farmed by stepping with a level trunk: a 1000-iteration run did
+    exactly that, pinning its hips at their HOME +/-5 deg, twisting hip_yaw
+    +/-17 deg to unload the feet, collecting both lift rewards anyway and drifting
+    80 deg of yaw. It is scale-free, so it costs nothing near the swing's
+    zero-crossings where the reference itself is small. DO NOT tighten this to
+    carry the sway on its own: a lift payment that demands a formed lean locks the
+    lift and the lean together and neither is ever discovered — measured at 0.3
+    with no other lift reward, the trunk never rolled at all for 550 iterations.
     """
     asset: Entity = env.scene[asset_cfg.name]
     local = dance_local_phase(_dance_command(env, command_name), rep_end)
     schedule = dance_step_schedule(local, walk_end, n_steps)
     air_time = env.scene[sensor_name].data.current_air_time
     assert air_time is not None, f"Sensor '{sensor_name}' has no air-time field."
-    held_up = ((air_time > threshold_min) & (air_time < threshold_max)).to(torch.float32)
+    airborne = (air_time > 0.0).to(torch.float32)
     reference = dance_sway_reference(local, walk_end, n_steps, amplitude)
     roll = _dance_trunk_roll(asset)
     leaning = (roll * reference >= lean_frac * reference ** 2).to(torch.float32).unsqueeze(-1)
-    return (schedule * held_up * leaning).sum(dim=-1)
+    return (schedule * airborne * leaning).sum(dim=-1)
+
+
+def dance_air_time(
+    env: ManagerBasedRlEnv,
+    command_name: str,
+    sensor_name: str,
+    rep_end: float,
+    walk_end: float,
+    threshold_min: float = 0.125,
+    threshold_max: float = 0.300,
+) -> torch.Tensor:
+    """The stock `feet_air_time`, paying only inside the walk window.
+
+    Same term, same 0.125-0.3 s window, either foot — the ONLY change is the
+    window mask. The stock version has to be cloned rather than configured because
+    its ``command_threshold`` gate can never close here: the twist slot carries a
+    unit-circle phase, so the command norm is always 1.0 and the gate is always
+    open. That made it an always-open payment for lifting a foot, which in the
+    closing stand — where every other dance term is off and nothing competes — was
+    free money: a 1000-iteration run kept one foot airborne for 89 % of the stand
+    and never stood at all.
+
+    It is also the ladder the whole routine hangs off. A foot can only STAY off
+    the ground if the weight is on the other one, and unloading that one takes
+    about 8 deg of trunk lean (the stance foot's inner edge is 21 mm off the
+    centreline with the CoM 148 mm up). So paying for a foot held up 0.125-0.3 s
+    is what teaches the sustained single support that the sway is made of; paying
+    only for ``air_time > 0`` (any touch-and-go hop) teaches that a lift can be
+    taken with a level trunk, and a 1000-iteration run then never rolled at all.
+    """
+    local = dance_local_phase(_dance_command(env, command_name), rep_end)
+    air_time = env.scene[sensor_name].data.current_air_time
+    assert air_time is not None, f"Sensor '{sensor_name}' has no air-time field."
+    in_range = ((air_time > threshold_min) & (air_time < threshold_max)).to(torch.float32)
+    in_walk = (local < walk_end).to(torch.float32)
+    return in_range.sum(dim=-1) * in_walk
 
 
 def dance_forward_progress(

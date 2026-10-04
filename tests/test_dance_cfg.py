@@ -333,24 +333,39 @@ def _step(env):
     ).item()
 
 
-def test_the_lift_only_pays_while_the_foot_is_held_up_long_enough():
-    """The 0.125-0.3 s window is the load-bearing part of the term: a foot cannot
-    STAY off the ground unless the weight is on the other one, which takes ~8 deg
-    of trunk lean. Paying for any touch-and-go hop instead paid for a lift with a
-    level trunk, and the trunk then never rolled at all."""
-    at_peak = _sway_local(0.25)  # right foot's half-cycle
+def _dance_air(env):
+    return microduck_mdp.dance_air_time(
+        env,
+        command_name="twist",
+        sensor_name="feet_ground_contact",
+        rep_end=REP_END,
+        walk_end=WALK_END,
+        threshold_min=0.125,
+        threshold_max=0.300,
+    ).item()
 
-    def _score(air):
-        return _step(_dance_env(at_peak, air_time=torch.tensor([[0.0, air]])))
 
-    assert _score(0.20) == pytest.approx(1.0)   # held up inside the window
-    assert _score(0.05) == 0.0                  # too brief: a hop, not a step
-    assert _score(0.35) == 0.0                  # too long: a stall, not a step
+def test_air_time_is_the_stock_term_with_a_walk_window_mask():
+    """The clone is `feet_air_time` unchanged — 0.125-0.3 s, EITHER foot — plus a
+    mask. The mask is what lets the closing stand actually stand: the stock gate
+    can never close on a unit-circle phase, so lifting a foot there was free money
+    (measured: one foot airborne for 89 % of the stand)."""
+    mid_walk = _dance_env(WALK_END * 0.25, air_time=torch.tensor([[0.0, 0.2]]))
+    assert _dance_air(mid_walk) == pytest.approx(1.0)   # right foot inside the window
+    # either foot counts, as in the stock term
+    both = _dance_env(WALK_END * 0.25, air_time=torch.tensor([[0.2, 0.2]]))
+    assert _dance_air(both) == pytest.approx(2.0)
+    # a touch-and-go hop is not a held lift
+    brief = _dance_env(WALK_END * 0.25, air_time=torch.tensor([[0.0, 0.05]]))
+    assert _dance_air(brief) == 0.0
+    # the closing stand pays nothing, however long a foot is held up
+    stand = _dance_env(0.0, command=_tail(0.5), air_time=torch.tensor([[0.0, 0.2]]))
+    assert _dance_air(stand) == 0.0
 
 
 def test_step_tracking_needs_the_schedule_and_the_lift():
     # At a swing zero-crossing the reference is 0, so the lean test is vacuous
-    # there and a scheduled foot held up for the window is simply a step.
+    # there and a scheduled airborne foot is simply a step.
     env = _dance_env(0.0, air_time=torch.tensor([[0.0, 0.2]]))
     assert _step(env) == pytest.approx(1.0)
     # ... and the WRONG foot being up is not a step either
@@ -358,27 +373,26 @@ def test_step_tracking_needs_the_schedule_and_the_lift():
     assert _step(wrong) == 0.0
 
 
-def test_the_lift_requires_the_lean_sign_not_a_formed_lean():
-    """The lift is the ladder the gait is learned on, so it must NOT require a
-    formed lean: a foot is only unloaded by leaning over the other one, and a gate
-    that demands both locks them together. Measured at lean_frac 0.3, the trunk
-    never rolled at all for 550 iterations. What it does require is the correct
-    SIGN, so a level shuffle leaning the wrong way is still not paid."""
+def test_the_lift_timing_still_needs_the_lean():
+    """`dance_step_tracking` is only a guard on top of `air_time`; it must not be
+    loosened to carry the sway by itself. Without the lean condition the policy
+    twisted its hips to lift the feet with a level trunk, collecting the lift
+    rewards anyway and drifting 80 deg of yaw."""
     left_peak = _sway_local(0.25)  # the reference leans left here, right foot up
     air = torch.tensor([[0.0, 0.2]])
     # leaning the full reference: paid
     leaning = _dance_env(left_peak, gravity=_lean(DANCE_SWAY_AMPLITUDE), air_time=air)
     assert _step(leaning) == pytest.approx(1.0)
-    # leaning only a token amount: still paid — this is the ladder
+    # leaning only a token amount (< lean_frac of the reference): not paid
     token = _dance_env(left_peak, gravity=_lean(0.2 * DANCE_SWAY_AMPLITUDE), air_time=air)
-    assert _step(token) == pytest.approx(1.0)
-    # level trunk: paid, because `roll * ref >= 0` holds at roll = 0
+    assert _step(token) == 0.0
+    # level trunk (the strategy that was actually learned): not paid
     level = _dance_env(left_peak, air_time=air)
-    assert _step(level) == pytest.approx(1.0)
+    assert _step(level) == 0.0
     # leaning the WRONG way: not paid
     wrong_way = _dance_env(left_peak, gravity=_lean(-DANCE_SWAY_AMPLITUDE), air_time=air)
     assert _step(wrong_way) == 0.0
-    assert DANCE_LEAN_FRAC == pytest.approx(0.0)
+    assert DANCE_LEAN_FRAC == pytest.approx(0.3)
 
 
 def _progress_env(local):
@@ -496,8 +510,9 @@ def test_the_squat_is_gone():
 
 def test_the_bounce_terms_are_gone():
     """The in-place bounce was replaced, not patched: none of its task terms may
-    come back, and neither may the stock `air_time`, whose always-open command
-    gate would pay for lifting a foot straight through the closing stand."""
+    come back. `air_time` stays, but as the walk-windowed clone — the stock term's
+    always-open command gate would pay for lifting a foot straight through the
+    closing stand."""
     cfg = make_microduck_dance_env_cfg()
     for name in (
         "bounce_roll_tracking",
@@ -509,7 +524,10 @@ def test_the_bounce_terms_are_gone():
         "bounce_head_hold",
     ):
         assert name not in cfg.rewards, name
-    assert "air_time" not in cfg.rewards
+    assert cfg.rewards["air_time"].func is microduck_mdp.dance_air_time
+    assert cfg.rewards["air_time"].weight == pytest.approx(3.0)
+    assert cfg.rewards["air_time"].params["threshold_min"] == pytest.approx(0.125)
+    assert cfg.rewards["air_time"].params["threshold_max"] == pytest.approx(0.300)
     for name in (
         "bounce_phase",
         "bounce_roll_reference",
