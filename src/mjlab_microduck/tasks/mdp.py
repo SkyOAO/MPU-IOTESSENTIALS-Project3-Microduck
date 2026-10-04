@@ -5080,9 +5080,9 @@ def dance_local_phase(
 
     The N_REPS repetitions occupy [0, rep_end) of the period and everything after
     that is the stand the routine ends on. Returning 1.0 there closes every
-    window test at once — walk, sway and foot lifts all stop — so the stand needs
-    no terms of its own: the sway reference is level, the feet stay planted, and
-    the posture / pitch / heading terms already hold it.
+    window test at once — the walk and its foot lifts both stop — so the stand
+    needs no terms of its own: the sway reference is level, the feet stay
+    planted, and the posture / pitch / heading terms already hold it.
     """
     u = torch.clamp(dance_phase(command) / rep_end, max=1.0)
     local = (u * n_reps) % 1.0
@@ -5165,46 +5165,44 @@ def _dance_forward_offset(env: ManagerBasedRlEnv, asset: Entity) -> torch.Tensor
 def dance_sway_reference(
     local: torch.Tensor,
     walk_end: float,
-    n_sways: int,
+    n_steps: int,
     amplitude: float,
 ) -> torch.Tensor:
-    """Trunk roll target (rad): level while walking, N_SWAYS sways once standing.
+    """Trunk roll target (rad): one sway per step, level outside the walk window.
 
-    The two halves of a repetition are deliberately separate motions. Sharing one
-    term across both (one lean per step, which an earlier version did) reads on
-    video as a shuffling walk rather than a sway, and makes the lean compete with
-    the step for balance.
+    The lean IS the step — the trunk leans LEFT exactly while the RIGHT foot is
+    airborne — which is what makes this look learnable: a walking trunk already
+    rolls a few degrees, so the reference only has to amplify a motion the robot
+    is making anyway. The split alternative ("walk level, then sway on the spot")
+    instead asks for a single-support lean from a standstill; measured, the robot
+    settles at 0.4 deg there and never learns it.
 
-    The sway starts and ends at 0, so the hand-overs into and out of it are level.
+    The sinusoid starts and ends at 0, so the last step hands over to the level
+    closing stand without a step in the target.
     """
-    in_sway = ((local >= walk_end) & (local < 1.0)).to(torch.float32)
-    t = (local - walk_end) / (1.0 - walk_end)
-    return amplitude * torch.sin(2.0 * math.pi * n_sways * t) * in_sway
+    in_walk = (local < walk_end).to(torch.float32)
+    return amplitude * torch.sin(2.0 * math.pi * n_steps * local / walk_end) * in_walk
 
 
 def dance_step_schedule(
     local: torch.Tensor,
     walk_end: float,
     n_steps: int,
-    n_sways: int,
 ) -> torch.Tensor:
     """Which foot should be off the ground: ``[N, 2]`` of (LEFT up, RIGHT up).
 
-    One lift per half-cycle, RIGHT foot first, running over the WHOLE routine:
-    the walk half at its own cadence, the sway half at the sway cadence. In the
-    walk a lift is a step; in the sway it is the other half of the bounce — the
-    trunk leans LEFT exactly while the RIGHT foot is airborne. A 15 deg lean with
-    both feet planted is not a pose this robot holds (measured: it settles at
-    0.4 deg and simply stands there), because the weight has nowhere to go.
+    One lift per half-cycle, RIGHT foot first, at the sway's own cadence. Because
+    the reference swings with the same phase, a lift and a lean are the same
+    event: the trunk leans LEFT exactly while the RIGHT foot is airborne, so the
+    weight has somewhere to go. A 15 deg lean with both feet planted is not a
+    pose this robot holds (measured: it settles at 0.4 deg and simply stands
+    there). Both feet stay planted in the closing stand.
     """
     in_walk = local < walk_end
-    walk_phase = local / walk_end * n_steps
-    sway_phase = (local - walk_end) / (1.0 - walk_end) * n_sways
-    phase = torch.where(in_walk, walk_phase, sway_phase) % 1.0
-    lifted = (local < 1.0).to(torch.float32)  # the closing stand: feet planted
-    right_up = (phase < 0.5).to(torch.float32) * lifted
-    left_up = (1.0 - (phase < 0.5).to(torch.float32)) * lifted
-    return torch.stack((left_up, right_up), dim=-1)
+    phase = (local / walk_end * n_steps) % 1.0
+    right_up = (phase < 0.5) & in_walk
+    left_up = (~right_up) & in_walk
+    return torch.stack((left_up.to(torch.float32), right_up.to(torch.float32)), dim=-1)
 
 
 # --------------------------------------------------------------------------- #
@@ -5216,30 +5214,28 @@ def dance_sway_tracking(
     n_reps: int,
     rep_end: float,
     walk_end: float,
-    n_sways: int,
+    n_steps: int,
     amplitude: float,
     std: float = 0.10,
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
-    """MAIN sway term: the standing half of the routine leans left and right.
+    """MAIN sway term: the trunk leans with the step rhythm (the bounce's look).
 
-    ``exp(-((roll - reference) / std)^2)``, the bounce's own shape and the one
-    the look was tuned on, scored in the sway window and nowhere else.
+    ``exp(-((roll - reference) / std)^2)`` over the walk window and nowhere else.
+    The Gaussian is the look; `dance_sway_l1` carries the gradient, because at
+    15° of lean against a 0.10 rad std the Gaussian is saturated, and at the
+    policy's own operating point (roll ~0) its slope is only ~0.3/rad — a
+    400-iteration run sat on that flat spot and never left it.
 
-    The window gate is what leaves leaning as the only way to collect this
-    term. Ungated, it also paid out in the walk and closing-stand halves (their
-    reference is 0 and a walking trunk is close to level), which came to ~3.2 of
-    the 5.0 — and paid MORE per step in the walk half than in the sway half. A
-    400-iteration run collected that subsidy: the sway metric stayed at 0.2° and
-    this term was flat from iteration ~150 on, because actually leaning is a
-    single-support move the policy had no reason to risk. Gated, the same
-    behaviour scores ~0.5 and the window prices only the lean.
+    The window gate keeps the term from paying for anything but the lean: ungated
+    it also paid out wherever the reference is 0 (the stand tail), worth ~1.0 of
+    the 5.0 for a robot that never leans at all.
     """
     asset: Entity = env.scene[asset_cfg.name]
     local = dance_local_phase(_dance_command(env, command_name), n_reps, rep_end)
-    reference = dance_sway_reference(local, walk_end, n_sways, amplitude)
-    in_sway = ((local >= walk_end) & (local < 1.0)).to(torch.float32)
-    return torch.exp(-(((_dance_trunk_roll(asset) - reference) / std) ** 2)) * in_sway
+    reference = dance_sway_reference(local, walk_end, n_steps, amplitude)
+    in_walk = (local < walk_end).to(torch.float32)
+    return torch.exp(-(((_dance_trunk_roll(asset) - reference) / std) ** 2)) * in_walk
 
 
 def dance_sway_l1(
@@ -5248,22 +5244,22 @@ def dance_sway_l1(
     n_reps: int,
     rep_end: float,
     walk_end: float,
-    n_sways: int,
+    n_steps: int,
     amplitude: float,
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
     """L1 companion to the sway Gaussian (≤ 0 → POSITIVE weight).
 
-    The Gaussian is nearly flat at the sway peaks (15° of lean against a 0.10 rad
-    std), so it alone would leave the first half-cycle without a usable gradient.
-    Constant gradient, bounded by the amplitude, so it cannot pay the robot to
-    terminate early.
+    The Gaussian is nearly flat at the swing peaks (15° of lean against a 0.10
+    rad std), so it alone would leave each step's swing without a usable
+    gradient. Constant gradient, bounded by the amplitude, so it cannot pay the
+    robot to terminate early.
     """
     asset: Entity = env.scene[asset_cfg.name]
     local = dance_local_phase(_dance_command(env, command_name), n_reps, rep_end)
-    reference = dance_sway_reference(local, walk_end, n_sways, amplitude)
-    in_sway = ((local >= walk_end) & (local < 1.0)).to(torch.float32)
-    return -(_dance_trunk_roll(asset) - reference).abs() * in_sway
+    reference = dance_sway_reference(local, walk_end, n_steps, amplitude)
+    in_walk = (local < walk_end).to(torch.float32)
+    return -(_dance_trunk_roll(asset) - reference).abs() * in_walk
 
 
 def dance_step_tracking(
@@ -5274,7 +5270,6 @@ def dance_step_tracking(
     rep_end: float,
     walk_end: float,
     n_steps: int,
-    n_sways: int,
     amplitude: float,
     lean_frac: float = 0.3,
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
@@ -5284,20 +5279,22 @@ def dance_step_tracking(
     This is the timing half of the gait: `feet_air_time` (kept, from the velocity
     recipe) pays for a foot that stays up 0.125-0.3 s and `foot_clearance` /
     `foot_swing_height` shape how high it gets, but neither of them knows WHICH
-    foot or WHEN. In the sway half this term is also what pairs the lean with the
-    lift: leaning LEFT is scheduled at the same phase as the RIGHT foot being up.
+    foot or WHEN. It is also what couples the lean to the lift — leaning LEFT is
+    scheduled at the same phase as the RIGHT foot being up — so the step and the
+    sway are one motion rather than two to be balanced against each other.
 
     The lift only pays while the trunk is actually leaning the way that phase
     asks, at least ``lean_frac`` of the way there. Without that condition the
     policy lifts the feet by twisting the hips instead — a 1000-iteration run
     measured the hips pinned at their HOME +/-5 deg, the trunk at +/-2 deg
     against a +/-15 deg reference, both lift rewards collected anyway, and 80 deg
-    of yaw drift from the twisting. The gate is scale-free and vanishes in the
-    walk half, where the reference is 0 and the test is vacuously true.
+    of yaw drift from the twisting. The test is scale-free, so it costs nothing
+    at the zero-crossings between steps, and it is what stops the sway from being
+    farmed by stepping while staying level.
     """
     asset: Entity = env.scene[asset_cfg.name]
     local = dance_local_phase(_dance_command(env, command_name), n_reps, rep_end)
-    schedule = dance_step_schedule(local, walk_end, n_steps, n_sways)
+    schedule = dance_step_schedule(local, walk_end, n_steps)
     air_time = env.scene[sensor_name].data.current_air_time
     assert air_time is not None, f"Sensor '{sensor_name}' has no air-time field."
     airborne = torch.stack(
@@ -5307,7 +5304,7 @@ def dance_step_tracking(
         ),
         dim=-1,
     )
-    reference = dance_sway_reference(local, walk_end, n_sways, amplitude)
+    reference = dance_sway_reference(local, walk_end, n_steps, amplitude)
     roll = _dance_trunk_roll(asset)
     leaning = (roll * reference >= lean_frac * reference ** 2).to(torch.float32).unsqueeze(-1)
     return (schedule * airborne * leaning).sum(dim=-1)
@@ -5423,21 +5420,22 @@ def dance_metric_sway_amp_deg(
     n_reps: int,
     rep_end: float,
     walk_end: float,
-    n_sways: int,
+    n_steps: int,
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
-    """Sway amplitude in phase with the reference (degrees), sway window only.
+    """Sway amplitude in phase with the reference (degrees), walk window only.
 
     Twice the roll times the reference's own shape: its episode average
     (reduce="mean") is the part of the roll in phase with the commanded rhythm,
-    which a single outlier cannot set.
+    which a single outlier cannot set. The scale is ``walk share x lean``, so a
+    perfect 15 deg swing over a 2.0 s walk inside a 2.5 s period reads ~12 deg,
+    not 15.
     """
     asset: Entity = env.scene[asset_cfg.name]
     local = dance_local_phase(_dance_command(env, command_name), n_reps, rep_end)
-    t = (local - walk_end) / (1.0 - walk_end)
-    shape = torch.sin(2.0 * math.pi * n_sways * t)
-    in_sway = ((local >= walk_end) & (local < 1.0)).to(torch.float32)
-    return 2.0 * _dance_trunk_roll(asset) * shape * in_sway * _DEG
+    shape = torch.sin(2.0 * math.pi * n_steps * local / walk_end)
+    in_walk = (local < walk_end).to(torch.float32)
+    return 2.0 * _dance_trunk_roll(asset) * shape * in_walk * _DEG
 
 
 def dance_metric_forward_m(

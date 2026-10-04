@@ -1,37 +1,37 @@
-"""Microduck dance routine — walk a set distance, then sway on the spot (x2).
+"""Microduck dance routine — walk DANCE_FORWARD_M forward, swaying with each step.
 
 Episodic phase policy replacing the in-place bounce (2026-10-03: the bounce
 itself tracked well, but a move whose feet are mostly airborne cannot hold a
-heading — it drifted ~0.9 m per 5 s episode). The routine walks instead, so the
-feet have traction and the heading is controllable:
+heading — it drifted ~0.9 m per 5 s episode). Walking fixes that: the feet have
+traction, so the heading is controllable.
 
-    one period (``DANCE_PERIOD_S``) = N_REPS repetitions, each split into
-      [0, WALK_END)      walk forward DANCE_FORWARD_M at N_STEPS steps
-      [WALK_END, 1.0)    N_SWAYS left-right sways on the spot
+    one period (``DANCE_PERIOD_S``) = one walk, then a short closing stand
+      [0, WALK_END)      walk DANCE_FORWARD_M at N_STEPS swaying steps
+      [WALK_END, 1.0)    closing stand, both feet planted
 
-Walk half: specified by DISTANCE (15 cm), not by a step count. ``dance_forward_
-progress`` pays new forward ground (potential-based, so marching in place pays
-nothing) and ``dance_heading_l1`` keeps the run straight. The gait itself is the
-velocity recipe's own shaping — ``air_time`` (3.0, 0.125-0.3 s), ``foot_clearance``
-and ``foot_swing_height`` (target 0.02), ``foot_slip`` — plus ``dance_step_tracking``
-for timing, since none of the stock terms knows WHICH foot should be up when.
+The sway is FUSED into the walk, which is the only structure that has ever
+produced it: the trunk leans ``DANCE_SWAY_DEG`` left and right once per step and
+the right foot lifts while the trunk leans left, so a lift and a lean are the
+same event (``dance_sway_reference`` and ``dance_step_schedule`` run off one
+phase). Splitting it — walk level, then sway on the spot — was tried 2026-10-04
+and never produced a lean in any run, because it asks for a single-support lean
+from a standstill where the robot settles at 0.4 deg of trunk roll instead.
+Walking already rolls the trunk a few degrees, so the reference only has to
+amplify a motion the robot is making anyway.
 
-Sway half: the look that was signed off — ``DANCE_SWAY_DEG`` of trunk lean at
-``SWAY_S / N_SWAYS`` per left-right cycle, scored by ``dance_sway_tracking`` +
-``dance_sway_l1``, with the lean paired to the opposite foot being airborne so the
-weight has somewhere to go (``dance_step_schedule`` keeps alternating through this
-half as well). That pairing is why the sway works at all: with both feet planted
-the robot settles at 0.4 deg of lean and simply stands, measured. The shape,
-amplitude and cadence are unchanged from the signed-off version; both scoring terms
-are window-gated, because the ungated Gaussian paid more for standing level than
-for leaning (see ``dance_sway_tracking``).
+Distance is the spec (``DANCE_FORWARD_M``); ``N_STEPS`` only sets the cadence it
+is covered at. ``dance_forward_progress`` pays new forward ground
+(potential-based, so marching in place pays nothing) and ``dance_heading_l1``
+keeps the run straight. The gait itself is the velocity recipe's own shaping —
+``air_time`` (3.0, 0.125-0.3 s), ``foot_clearance`` and ``foot_swing_height``
+(target 0.02), ``foot_slip`` — plus ``dance_step_tracking``, the only term that
+knows WHICH foot should be up WHEN and that refuses to pay for a lift taken with
+a level trunk. The remaining terms are containment: ``dance_pitch_balance`` and
+``dance_head_hold``.
 
-The remaining terms are containment: ``dance_heading_l1`` (whole routine, the
-bounce's heading pair), ``dance_pitch_balance`` and ``dance_head_hold``.
-
-The squats this routine originally ended with were dropped (2026-10-04): with a
-25 mm dip on a 0.45 s cycle the height term's Gaussian is already saturated ~20 mm
-away from the target, so it gives no gradient, and neither the dip reward nor any
+The squats an earlier version ended with were dropped (2026-10-04): with a 25 mm
+dip on a 0.45 s cycle the height term's Gaussian is already saturated ~20 mm away
+from the target, so it gives no gradient, and neither the dip reward nor any
 amount of training ever moved the trunk off its standing height.
 
 Phase travels in the twist slot over the unit circle (``[cos, sin, 0]``) — the
@@ -102,54 +102,47 @@ ENCODER_BIAS_RANGE = (-0.015, 0.015)  # ±0.86° per-joint encoder offset (const
 BASE_ORIENTATION_MAX_PITCH_DEG = 10.0  # ±10° forward/backward tilt at episode start
 BASE_ORIENTATION_MAX_ROLL_DEG = 5.0  # ±5° side-to-side tilt at episode start
 
-# Routine timing. One period is one full routine (both repetitions) and the
-# episode is exactly one period, so the phase starts and ends at 0 (the
-# standing hand-over the runtime button presses give).
+# Routine timing. One period is one full walk and the episode is exactly one
+# period, so the phase starts and ends at 0 (the standing hand-over the runtime
+# button presses give).
 #
-# Each repetition is two SEPARATE halves: walk forward a set distance, then sway
-# left-right on the spot. Running them at the same time (one lean per step, which
-# an earlier version did) reads as a shuffling walk instead of a sway, and makes
-# the lean compete with the step for balance.
-N_REPS = 2
-WALK_S = 1.5      # 3 steps at 0.5 s — a normal walking cadence
-SWAY_S = 1.5      # 3 left-right cycles at 0.5 s — the sway's own cadence, from
-                  # the version it was signed off in (15 deg, lean per half-cycle)
-# The routine is the repetitions, then a short closing stand. The stand is the
-# tail of the PERIOD, not of each repetition: the robot does walk-sway twice and
-# only then settles. It needs no reward terms of its own — the phase decode puts
-# every window closed and every reference level there, so the posture, pitch and
-# heading terms that already exist are what hold the robot upright.
+# The walk is the whole routine; the closing stand is only the period's tail. It
+# needs no reward terms of its own — the phase decode puts every window closed
+# and every reference level there, so the posture, pitch and heading terms that
+# already exist are what hold the robot upright.
+N_REPS = 1
+WALK_S = 2.0      # N_STEPS swaying steps at 0.5 s — a normal walking cadence
 STAND_S = 0.5
-REPS_S = N_REPS * (WALK_S + SWAY_S)            # 6.0 s
-DANCE_PERIOD_S = REPS_S + STAND_S              # 6.5 s
-EPISODE_LENGTH_S = DANCE_PERIOD_S              # 325 steps @ 50 Hz
-WALK_END = WALK_S / (WALK_S + SWAY_S)
+REPS_S = N_REPS * WALK_S                       # 2.0 s
+DANCE_PERIOD_S = REPS_S + STAND_S              # 2.5 s
+EPISODE_LENGTH_S = DANCE_PERIOD_S              # 125 steps @ 50 Hz
+WALK_END = 1.0    # the walk fills every repetition; the stand is the tail
 REP_END = REPS_S / DANCE_PERIOD_S
-N_STEPS = 3
-N_SWAYS = 3
+N_STEPS = 4
 
 # Reverse-curriculum spawn mix: the fraction of episodes that start at phase 0,
-# the real deployment hand-over. The rest start anywhere in the routine, so the
-# second repetition gets on-policy data on its own instead of only when the
-# policy survives the walk that precedes it.
+# the real deployment hand-over. The rest start partway through the walk, so the
+# last steps get on-policy data even while early episodes still end before they
+# reach them.
 DANCE_START_PHASE_PROB = 0.35
 
-# Sway amplitude at each lean's peak, unchanged from the version this look was
-# signed off in.
+# Trunk lean at each swing's peak, unchanged from the version this look was
+# signed off in. One left-right swing per step, so the look and the step rhythm
+# are the same clock.
 DANCE_SWAY_DEG = 15.0
 DANCE_SWAY_AMPLITUDE = math.radians(DANCE_SWAY_DEG)
 
 # How far into the commanded lean a lift has to be before it pays, as a fraction
 # of the reference. 0.3 = the trunk must be at least 30% of the way there while
-# the scheduled foot is up; it costs nothing near the sway's zero crossings,
+# the scheduled foot is up; it costs nothing near the swing's zero crossings,
 # where the reference itself is small.
 DANCE_LEAN_FRAC = 0.3
 
-# How far the walk half must carry the robot. This is the spec — the step count
-# above only sets the cadence it is covered at. Paid as potential-based progress,
-# so it is a distance the policy must cover, not a per-step rate it can farm.
-# 15 cm is what the walking policy in the CPU/BAM rehearsal reaches in ~2 s.
-DANCE_FORWARD_M = 0.15
+# How far the walk must carry the robot. This is the spec — the step count above
+# only sets the cadence it is covered at. Paid as potential-based progress, so it
+# is a distance the policy must cover, not a per-step rate it can farm. 20 cm
+# over the 2 s walk is 0.1 m/s, a quarter of the velocity recipe's ±0.4 m/s.
+DANCE_FORWARD_M = 0.20
 
 import mujoco as _mujoco
 import mjlab.terrains as terrain_gen
@@ -379,35 +372,34 @@ def make_microduck_dance_env_cfg(
         params={"sensor_name": self_collision_cfg.name},
     )
 
-    # --- The routine: walk a set distance, then sway on the spot ---------------
+    # --- The routine: one walk that sways with its own steps -------------------
     # Every term below is phase-referenced, so none of them can be farmed by
-    # standing still, and each half only pays inside its own window.
+    # standing still, and each only pays inside its own window.
     dance_cmd = {"command_name": "twist", "n_reps": N_REPS, "rep_end": REP_END}
     walk_params = {**dance_cmd, "walk_end": WALK_END}
-    sway_params = {**walk_params, "n_sways": N_SWAYS}
-    step_params = {**sway_params, "n_steps": N_STEPS}
+    step_params = {**walk_params, "n_steps": N_STEPS}
 
-    # The sway half (the bounce's look; both terms are window-gated, so neither
-    # scores outside it). The Gaussian is the look, the L1 is the gradient: at 15°
-    # of lean the Gaussian has already saturated, so in the window's first
-    # half-cycle it is too flat to move the policy, which is what the L1 is for.
-    # It carries 2.0 rather than the bounce's 0.6 because 0.6/rad was the WHOLE
-    # gradient at the policy's own operating point (roll ~0, where the Gaussian's
-    # slope is only ~0.3/rad) — a 400-iteration run simply sat on that flat spot.
+    # The look. Both terms are window-gated, so neither scores in the closing
+    # stand. The Gaussian is the look, the L1 is the gradient: at 15° of lean the
+    # Gaussian has saturated, so each swing would otherwise start with no slope to
+    # follow. The L1 carries 2.0 rather than the bounce's 0.6 because 0.6/rad was
+    # the WHOLE gradient at the policy's own operating point (roll ~0, where the
+    # Gaussian's slope is only ~0.3/rad) — a 400-iteration run simply sat there.
     cfg.rewards["dance_sway_tracking"] = RewardTermCfg(
         func=microduck_mdp.dance_sway_tracking,
         weight=5.0,
-        params={**sway_params, "amplitude": DANCE_SWAY_AMPLITUDE, "std": 0.10},
+        params={**step_params, "amplitude": DANCE_SWAY_AMPLITUDE, "std": 0.10},
     )
     cfg.rewards["dance_sway_l1"] = RewardTermCfg(
         func=microduck_mdp.dance_sway_l1,
         weight=2.0,
-        params={**sway_params, "amplitude": DANCE_SWAY_AMPLITUDE},
+        params={**step_params, "amplitude": DANCE_SWAY_AMPLITUDE},
     )
 
-    # Which foot is up, for the whole routine: a step in the walk half, the
-    # counterweight to the lean in the sway half. Paying only when it also clears
-    # DANCE_STEP_LIFT_M is what turns the shuffle back into steps.
+    # Which foot is up, for the whole walk. A lift only pays while the trunk is
+    # leaning the way that step asks (`lean_frac` of the reference), which is what
+    # stops the sway from being farmed by stepping on a level trunk — that was the
+    # 1000-iteration run whose hips twisted instead of leaning.
     cfg.rewards["dance_step_tracking"] = RewardTermCfg(
         func=microduck_mdp.dance_step_tracking,
         weight=3.0,
@@ -425,10 +417,10 @@ def make_microduck_dance_env_cfg(
         params={**walk_params, "target_distance": DANCE_FORWARD_M},
     )
 
-    # The walker drifts 6–8°/s open loop, so a walk would visibly turn the robot
-    # and the second repetition would start crooked (≤ 0 → POSITIVE weight).
-    # Whole-routine, like the bounce's heading pair: the sway shifts the weight
-    # side to side and turns the robot just as readily as the steps do.
+    # The walker drifts 6–8°/s open loop, so the walk would visibly turn the robot
+    # (≤ 0 → POSITIVE weight). Whole-routine, like the bounce's heading pair: the
+    # sway shifts the weight side to side and turns the robot just as readily as
+    # the steps do.
     cfg.rewards["dance_heading_l1"] = RewardTermCfg(
         func=microduck_mdp.dance_heading_l1,
         weight=1.0,
@@ -499,7 +491,7 @@ def make_microduck_dance_env_cfg(
     # curves. These are the numbers to read before touching a reward again.
     cfg.metrics["dance_sway_amp_deg"] = MetricsTermCfg(
         func=microduck_mdp.dance_metric_sway_amp_deg,
-        params=sway_params,
+        params=step_params,
         reduce="mean",
     )
     cfg.metrics["dance_forward_m"] = MetricsTermCfg(
@@ -808,8 +800,8 @@ def make_microduck_dance_env_cfg(
             "period": DANCE_PERIOD_S,
             # Deployment starts at phase 0 (standing) and the phase then runs on
             # its own clock, so that slice keeps starting there. The rest are
-            # scattered anywhere in the routine, because the policy otherwise
-            # only practices its second repetition by surviving the first one.
+            # scattered anywhere in the walk, because the policy otherwise only
+            # practises the last steps by surviving the ones that precede them.
             "randomize_phase": True,
             "zero_phase_prob": DANCE_START_PHASE_PROB,
         }
