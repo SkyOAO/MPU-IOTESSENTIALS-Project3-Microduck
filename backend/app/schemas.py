@@ -1,3 +1,4 @@
+from datetime import datetime
 from pydantic import BaseModel,Field,model_validator
 
 class CommandRequest(BaseModel):
@@ -19,4 +20,40 @@ class CommandRequest(BaseModel):
 class CommandResponse(BaseModel):
     command_id: str
     op: str
+    action: str | None = None
     status: str
+
+    @model_validator(mode="after")
+    def fill_action(self):
+        if self.action is None:
+            self.action = self.op
+        return self
+
+class CommandStatus(BaseModel):
+    command_id: str
+    op: str
+    action: str | None = None
+    status: str
+    created_at: datetime | None = None
+    completed_at: datetime | None = None
+
+    @model_validator(mode="after")
+    def fill_action(self):
+        if self.action is None:
+            self.action = self.op
+        return self
+
+
+class TelemetryLatest(BaseModel):
+    robot_id: str | None = None
+    ts: int | None = None
+    received_at: datetime | None = None
+    policy: str | None = None
+
+class ConsoleStatus(BaseModel):
+    status: str = "offline"
+    current_behavior: str | None = None
+    current_mode: str = "WALK"
+    last_command: str | None = None
+    timestamp: datetime | None = None
+    joints: dict = Field(default_factory=dict)

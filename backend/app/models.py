@@ -1,5 +1,5 @@
-from sqlalchemy import Column, Integer, String, DateTime
-from datetime import datetime,timezone
+from sqlalchemy import Column, Integer, BigInteger, String, DateTime, Float
+from sqlalchemy.dialects.postgresql import JSONB
 from app.database import Base
 from datetime import datetime, timezone, timedelta
 
@@ -21,5 +21,34 @@ class Command(Base):
     #完成时间
     completed_at = Column(DateTime(timezone=True), nullable=True)
 
+class CommandAck(Base):
+    __tablename__ = 'command_acks'
+
+    id = Column(BigInteger, primary_key=True, index=True)
+    #关联commands.command_id
+    command_id = Column(String, index=True)
+    #机器人编号
+    robot_id = Column(String, index=True)
+    #阶段:
+    phase = Column(String,nullable=False)
+    #结果:
+    result = Column(String,nullable=True)
+    #附加信息
+    detail = Column(String,nullable=True)
+
+    robot_ts = Column(BigInteger,nullable=True)
+
+    received_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
+
+class Telemetry(Base):
+    __tablename__ = 'telemetry'
+
+    id = Column(BigInteger, primary_key=True, index=True)
+    robot_id = Column(String, index=True)
+    ts = Column(BigInteger, nullable=True)
+    received_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True)
+    policy = Column(String, nullable=True)
+    payload = Column(JSONB, nullable=True)
 
 
