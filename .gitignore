@@ -38,3 +38,9 @@ backup_onnx/
 logdir/.claude/
 logdir/
 logdir/.claude/worktrees/
+
+MUJOCO_LOG.TXT
+.pytest_cache
+.codex
+.aws
+.agents
