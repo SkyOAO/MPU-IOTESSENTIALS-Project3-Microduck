@@ -5452,8 +5452,8 @@ def dance_metric_sway_amp_deg(
     Twice the roll times the reference's own shape: its episode average
     (reduce="mean") is the part of the roll in phase with the commanded rhythm,
     which a single outlier cannot set. The scale is ``walk share x lean``, so a
-    perfect 15 deg swing over a 4.0 s walk inside a 4.5 s period reads ~13.3 deg,
-    not 15.
+    perfect 15 deg swing over a 2.0 s walk inside a 2.5 s period reads ~12 deg,
+    not 15 — only the 80 % of the episode that is the walk window can score.
     """
     asset: Entity = env.scene[asset_cfg.name]
     local = dance_local_phase(_dance_command(env, command_name), rep_end)
