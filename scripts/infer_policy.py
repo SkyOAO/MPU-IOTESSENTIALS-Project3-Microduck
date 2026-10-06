@@ -36,9 +36,10 @@ except ImportError:
     _HAS_TTY_LIBS = False
 
 MICRODUCK_XML = "src/mjlab_microduck/robot/microduck/scene.xml"
+MICRODUCK_WALK_SCENE_XML = "src/mjlab_microduck/robot/microduck/scene_walk.xml"
 # MICRODUCK_XML = "src/mjlab_microduck/robot/microduck/scene_ramps.xml"
 # MICRODUCK_XML = "src/mjlab_microduck/robot/microduck/scene_floor_objects.xml"
-# MICRODUCK_XML = "src/mjlab_microduck/robot/microduck/scene_robot_walk.xml"
+# (the walk-robot scene is scene_walk.xml, selected automatically below)
 MICRODUCK_ROLLERS_XML = "src/mjlab_microduck/robot/microduck/scene_rollers.xml"
 MICRODUCK_BALL_XML = "src/mjlab_microduck/robot/microduck/scene_ball.xml"
 
@@ -264,7 +265,9 @@ class PolicyInference:
                  kick_left_onnx_path=None, kick_right_onnx_path=None,
                  roulade_onnx_path=None,
                  dance_onnx_path=None,
-                 kick_duration=3.0, roulade_duration=2.0, dance_duration=2.0):
+                 kick_duration=3.0, roulade_duration=2.0,
+                 dance_period=2.5, dance_duration=10.0,
+                 actuator_delay_min=0, actuator_delay_max=0):
         self.bam_ctrl = bam_ctrl  # bam.mujoco.MujocoController (None = legacy position actuators)
         self.model = model
         self.data = data
@@ -321,6 +324,31 @@ class PolicyInference:
             gp_input_shape = self.ground_pick_session.get_inputs()[0].shape
             print(f"Ground pick policy input shape: {gp_input_shape}")
 
+        # Load dance policy. It is PHASE-encoded, not constant-command: the twist
+        # slot has to carry [cos 2*pi*phase, sin 2*pi*phase, 0] with the phase
+        # advancing one cycle per `dance_period`. That is why it is NOT one of the
+        # behaviors below (kick/roulade are all-zero-command session swaps) — the
+        # behavior path forces the twist slot to zero, which pins the dance at
+        # phase 0 forever; the robot then just strides forward with no sway and no
+        # closing stand ("walks very fast, motion deformed"). See trigger_dance /
+        # update_dance_phase.
+        self.dance_session = None
+        self.dance_mode = False
+        self.dance_phase = 0.0
+        self.dance_period = dance_period
+        self.dance_duration = dance_duration
+        self.dance_time_left = 0.0
+        if dance_onnx_path:
+            if not self.new_cmd_obs:
+                raise ValueError(
+                    "--dance policies use the unified 13D command obs (61D); "
+                    "run with --new-cmd-obs"
+                )
+            print(f"\nLoading dance policy from: {dance_onnx_path} "
+                  f"(period={self.dance_period:.1f}s, press D)")
+            self.dance_session = ort.InferenceSession(dance_onnx_path)
+            print(f"dance policy input shape: {self.dance_session.get_inputs()[0].shape}")
+
         # Load sit policy. Two flavours share the Y key and self.sit_session:
         #  - --sit (is_sitstand=False): the OLD one-way sit policy. Sits
         #    unconditionally on a zero twist command; standing back up is done
@@ -371,7 +399,6 @@ class PolicyInference:
             ("kick_left", kick_left_onnx_path, kick_duration),
             ("kick_right", kick_right_onnx_path, kick_duration),
             ("roulade", roulade_onnx_path, roulade_duration),
-            ("dance", dance_onnx_path, dance_duration),
         ):
             if not path:
                 continue
@@ -449,6 +476,27 @@ class PolicyInference:
 
         # Last action (for observation history)
         self.last_action = np.zeros(self.n_joints, dtype=np.float32)
+
+        # Firmware-target delay, in SIM SUBSTEPS — the unit and the range the
+        # TRAINING actuator uses (_BAM_ACTUATOR_KWARGS in
+        # robot/microduck_constants.py: delay_min_lag=3, delay_max_lag=6). mjlab
+        # pushes the position target once per substep, so a 3-6 substep lag on a
+        # target that is constant within a control step mixes this step's and the
+        # previous step's target — about half a control step on average.
+        #
+        # Leaving it out is NOT neutral: the policy was trained to lean into that
+        # lag, so the same network drives harder without it. Measured on the dance
+        # checkpoint in this rehearsal, walk-window trunk roll 6.2 -> 7.8 deg and
+        # the sway metric 6.0 -> 10.9, against 8.6 / 9.8 in mjlab (training's own
+        # physics). That gap is what made the rehearsal look "much faster and
+        # deformed" than the same checkpoint in `uv run play`.
+        self.actuator_delay_min = actuator_delay_min
+        self.actuator_delay_max = actuator_delay_max
+        self.actuator_target = self.default_pose.copy()
+        self._substep_delay_buf = [
+            self.default_pose.copy() for _ in range(max(actuator_delay_max, 0) + 1)
+        ]
+        self._substep_delay_lag = 0
 
         # Velocity command [lin_vel_x, lin_vel_y, ang_vel_z] — controls walking / policy switching
         self.vel_cmd = np.zeros(3, dtype=np.float32)
@@ -534,8 +582,8 @@ class PolicyInference:
                 # all-zero twist is the STAND command for this policy, which is
                 # why feeding it the old sit-policy zero command did nothing.
                 cmd[0] = 1.0 if self.sit_mode else 0.0
-            # else standing/old-sit/ground_pick: leave twist 0 (ground_pick
-            # writes its phase encoding later)
+            # else standing/old-sit/ground_pick/dance: leave twist 0
+            # (ground_pick and dance overwrite it with their phase every step)
             cmd[3:7]  = self.head_offset
             cmd[7:13] = self.body_cmd  # [x, y, z, roll, pitch, yaw]
             self.command = cmd
@@ -565,6 +613,8 @@ class PolicyInference:
             return  # Only one policy loaded, no switching
         if self.ground_pick_mode:
             return  # Don't switch during ground pick
+        if self.dance_mode:
+            return  # Don't switch during the dance
         if self.sit_mode:
             return  # Don't switch while sitting
         if self.slope_mode:
@@ -742,6 +792,9 @@ class PolicyInference:
         if self.behavior_mode is not None:
             print(f"Cannot ground pick during {self.behavior_mode}")
             return
+        if self.dance_mode:
+            print("Cannot ground pick during the dance")
+            return
         self.ground_pick_mode = True
         self.ground_pick_phase = 0.0
         self.ort_session = self.ground_pick_session
@@ -776,6 +829,77 @@ class PolicyInference:
         self.command[1] = np.sin(2 * np.pi * self.ground_pick_phase)
         self.command[2] = 0.0
 
+    def trigger_dance(self):
+        """Start one dance cycle: phase runs 0 -> 1 over `dance_period`.
+
+        Unlike the kick/roulade behaviors this is a PHASE-encoded policy — the
+        routine only exists while the twist slot carries the advancing phase — so
+        a session swap alone would leave the robot holding the phase-0 pose
+        forever. update_dance_phase() writes the phase every control step and
+        hands back once the cycle completes.
+        """
+        if self.dance_session is None:
+            print("Dance unavailable: no --dance policy loaded")
+            return
+        if self.dance_mode:
+            print("Dance already in progress")
+            return
+        if self.ground_pick_mode:
+            print("Cannot dance during ground pick")
+            return
+        if self.behavior_mode is not None:
+            print(f"Cannot dance during {self.behavior_mode}")
+            return
+        if self.sit_mode:
+            print("Cannot dance while sitting (press Y to stand up first)")
+            return
+        if self.slope_mode:
+            print("Cannot dance during slope mode")
+            return
+        self.dance_mode = True
+        self.dance_phase = 0.0
+        self.dance_time_left = self.dance_duration
+        self.vel_cmd = np.zeros(3, dtype=np.float32)
+        self.ort_session = self.dance_session
+        self.current_policy = "dance"
+        print(f"Dance: started (period={self.dance_period:.1f}s, "
+              f"cap={self.dance_duration:.1f}s)")
+
+    def _end_dance(self):
+        """Switch back after one dance cycle completes."""
+        self.dance_mode = False
+        self.vel_cmd = np.zeros(3, dtype=np.float32)
+        if self.walking_session:
+            self.current_policy = "walking"
+            self.ort_session = self.walking_session
+        else:
+            self.current_policy = "standing"
+            self.ort_session = self.standing_session
+        self._update_command()
+        print(f"Dance: done → back to {self.current_policy}")
+
+    def update_dance_phase(self, dt: float):
+        """Advance the dance phase and write it into the twist slot.
+
+        ``dt`` must be the NOMINAL control step (decimation * sim timestep), never
+        the measured wall-clock step. The phase is defined in SIMULATED time: the
+        policy was trained with it advancing 1/period per 0.02 s of sim, so a
+        wall-clock dt makes the routine play faster than the physics does whenever
+        the viewer renders below 50 Hz — the joints then cannot keep up and the
+        motion visibly deforms.
+        """
+        if not self.dance_mode:
+            return
+        self.dance_time_left -= dt
+        self.dance_phase += dt / self.dance_period
+        if self.dance_phase >= 1.0 or self.dance_time_left <= 0.0:
+            self._end_dance()
+            return
+        # Dance and ground_pick both use slots [0..2] (the twist) as the phase.
+        self.command[0] = np.cos(2 * np.pi * self.dance_phase)
+        self.command[1] = np.sin(2 * np.pi * self.dance_phase)
+        self.command[2] = 0.0
+
     def trigger_behavior(self, name):
         """Start an episodic behavior (kick_left / kick_right / roulade).
 
@@ -798,6 +922,9 @@ class PolicyInference:
             return
         if self.slope_mode:
             print(f"Cannot start {name} during slope mode")
+            return
+        if self.dance_mode:
+            print(f"Cannot start {name} during the dance")
             return
         if name in ("kick_left", "kick_right"):
             self._place_ball(name)
@@ -912,6 +1039,12 @@ class PolicyInference:
 
     def apply_action(self, action):
         """Apply action to MuJoCo controls with optional delay."""
+        # Resample the firmware-target lag once per control step, as training does
+        # (trained with delay_min_lag=3, delay_max_lag=6 SIM SUBSTEPS).
+        if self.actuator_delay_max > 0:
+            self._substep_delay_lag = int(
+                np.random.randint(self.actuator_delay_min, self.actuator_delay_max + 1)
+            )
         if self.use_delay:
             self.action_buffer[self.buffer_index] = action.copy()
             delayed_index = (self.buffer_index - self.current_lag) % len(self.action_buffer)
@@ -935,10 +1068,27 @@ class PolicyInference:
         BAM: the firmware position loop lives in the controller (ctrl is the
         motor TORQUE it writes on update()). Legacy: MuJoCo position actuators.
         """
+        # Kept for apply_substep_actuator_delay(), which re-sends the delayed
+        # version before every BAM update.
+        self.actuator_target = np.asarray(target_positions, dtype=np.float32).copy()
         if self.bam_ctrl is not None:
             self.bam_ctrl.q_target[:] = target_positions
         else:
             self.data.ctrl[:] = target_positions
+
+    def apply_substep_actuator_delay(self):
+        """Delay the firmware position target by the training actuator's lag.
+
+        Call once per SIM SUBSTEP, immediately before ``bam_ctrl.update()`` —
+        that is where mjlab's actuator applies its own delay. No-op without BAM
+        or with the delay disabled (``--actuator-delay 0 0``).
+        """
+        if self.bam_ctrl is None or self.actuator_delay_max <= 0:
+            return
+        self._substep_delay_buf.append(self.actuator_target.copy())
+        del self._substep_delay_buf[0]
+        lag = min(self._substep_delay_lag, len(self._substep_delay_buf) - 1)
+        self.bam_ctrl.q_target[:] = self._substep_delay_buf[-1 - lag]
 
 
 class MqttCommandSubscriber(threading.Thread):
@@ -1182,7 +1332,7 @@ class MqttCommandSubscriber(threading.Thread):
         elif op == "roulade":
             self.policy.trigger_behavior("roulade")
         elif op == "dance":
-            self.policy.trigger_behavior("dance")
+            self.policy.trigger_dance()
         elif op == "ground_pick":
             self.policy.trigger_ground_pick()
         elif op == "switch_mode":
@@ -1210,8 +1360,9 @@ def main():
     parser.add_argument("--kick-left", type=str, default=None, help="Path to LEFT-foot ball kick policy ONNX (press K to trigger). Requires --new-cmd-obs. Loads a scene with a ball.")
     parser.add_argument("--kick-right", type=str, default=None, help="Path to RIGHT-foot ball kick policy ONNX (press L to trigger). Requires --new-cmd-obs. Loads a scene with a ball.")
     parser.add_argument("--roulade", type=str, default=None, help="Path to roulade (forward roll) policy ONNX (press R to trigger). Requires --new-cmd-obs.")
-    parser.add_argument("--dance", type=str, default=None, help="Path to dance policy ONNX (press D to trigger). Requires --new-cmd-obs.")
-    parser.add_argument("--dance-duration", type=float, default=2.0, help="Seconds the dance policy stays active (default: 10.0)")
+    parser.add_argument("--dance", type=str, default=None, help="Path to dance policy ONNX (press D to trigger). Requires --new-cmd-obs. PHASE-encoded: one press runs one full routine and returns.")
+    parser.add_argument("--dance-period", type=float, default=2.5, help="Dance cycle length in seconds; MUST match training (2.5 for the 2 s walk + 0.5 s stand routine)")
+    parser.add_argument("--dance-duration", type=float, default=10.0, help="Safety cap in seconds: hands back if the routine somehow does not complete (the normal exit is the end of the cycle)")
     parser.add_argument("--kick-duration", type=float, default=3.0, help="Seconds a kick policy stays active before handing back to standing/walking (default: 3.0)")
     parser.add_argument("--roulade-duration", type=float, default=2.0, help="Seconds the roulade policy stays active before handing back to standing/walking (default: 2.0, ~the roll itself; the standing/walking policy takes over for the settle)")
     parser.add_argument("--lin-vel-x", type=float, default=0.0, help="Initial linear velocity X command (m/s)")
@@ -1220,6 +1371,11 @@ def main():
     parser.add_argument("--action-scale", type=float, default=1.0, help="Action scale (default: 1.0)")
     parser.add_argument("--raw-accelerometer", action="store_true", help="Use raw accelerometer instead of projected gravity")
     parser.add_argument("--delay", type=int, nargs='*', default=None, help="Enable actuator delay: --delay MIN MAX or --delay LAG")
+    parser.add_argument("--actuator-delay", type=int, nargs=2, default=[3, 6], metavar=("MIN", "MAX"),
+                        help="Firmware position-target delay in SIM SUBSTEPS, mirroring the training BAM actuator "
+                             "(default 3 6). Resampled every control step, applied before each BAM substep. "
+                             "Set '0 0' to disable. Leaving it off makes the SAME policy drive noticeably harder "
+                             "than it does in training / `uv run play`.")
     parser.add_argument("--debug", action="store_true", help="Print observations and actions")
     parser.add_argument("--selftest", type=int, default=0,
                         help="自动做 N 轮坐立切换并统计成功率（0 = 关闭）。需要 --sitstand")
@@ -1298,15 +1454,46 @@ def main():
     # Load MuJoCo model. Kick policies get a scene with a ball to kick.
     # --scene overrides everything (any scene whose robot has the standard
     # 14-servo layout works, e.g. scene_allcollisions.xml).
+    #
+    # The robot MODEL has to match the one the policy was trained on:
+    #   robot_walk.xml          -> Velocity (walking) and Dance
+    #   robot_groundcontact.xml -> StandUp / SitStand / VelStand / Roulade / kick
+    #                              / ground_pick (they need body-ground contacts)
+    # The two differ ONLY in collision geometry (see the diff of the two XMLs:
+    # robot_groundcontact lets the hip, the upper legs, the head shells and an
+    # extra foot mesh hit the floor; robot_walk restricts world contacts to the
+    # feet). Running a walk-family policy on the groundcontact model makes it
+    # catch its own legs mid-swing and trip — the rehearsal then "walks totally
+    # differently / falls over" while the same checkpoint is fine in mjlab play.
+    # scene.xml and scene_walk.xml are byte-identical apart from that include.
+    _walk_family = bool(args.walking or args.dance)
+    _ground_family = bool(args.sit or args.sitstand or args.slope or args.ground_pick
+                          or args.kick_left or args.kick_right or args.roulade)
     if args.scene:
         xml_path = args.scene
     elif args.roller:
         xml_path = MICRODUCK_ROLLERS_XML
     elif args.kick_left or args.kick_right:
         xml_path = MICRODUCK_BALL_XML
+    elif _walk_family and not _ground_family:
+        # Pure walking/dance rehearsal: this is the model they were trained on.
+        xml_path = MICRODUCK_WALK_SCENE_XML
     else:
         xml_path = MICRODUCK_XML
+        if _walk_family:
+            print("[WARN] --walking/--dance are trained on robot_walk.xml, but "
+                  "sit/standup/kick/roulade/ground_pick need robot_groundcontact.xml "
+                  "(body-ground contacts). One of them is now on the wrong collision "
+                  "model — rehearse them in separate processes, or pass --scene.")
     print(f"Loading MuJoCo model from: {xml_path}")
+    try:
+        with open(xml_path) as _fh:
+            import re as _re2
+            _m = _re2.search(r'include file="([^"]+)"', _fh.read())
+        if _m:
+            print(f"  robot model: {_m.group(1)}")
+    except OSError:
+        pass
     bam_ctrl = None
     if not args.no_bam:
         # Same actuator the policies are trained against in warp (BAM M6 XL330,
@@ -1370,6 +1557,9 @@ def main():
         use_projected_gravity=not args.raw_accelerometer,
         ground_pick_onnx_path=args.ground_pick,
         ground_pick_period=args.ground_pick_period,
+        dance_period=args.dance_period,
+        actuator_delay_min=int(args.actuator_delay[0]),
+        actuator_delay_max=int(args.actuator_delay[1]),
         sit_onnx_path=args.sit,
         new_cmd_obs=args.new_cmd_obs,
         slope_onnx_path=args.slope,
@@ -1455,12 +1645,14 @@ def main():
         print(f"  Switch threshold: {policy.switch_threshold} (vel cmd magnitude)")
     if policy.ground_pick_session:
         print(f"Ground pick policy: loaded  (press G)")
+    if policy.dance_session:
+        print(f"Dance policy: loaded  (press D — one {policy.dance_period:.1f}s cycle)")
     if policy.sit_session:
         kind = "Sitstand" if policy.is_sitstand else "Sit"
         print(f"{kind} policy: loaded  (press Y to toggle)")
     if policy.slope_session:
         print(f"Slope policy: loaded  (press Y to toggle, passive descent)")
-    _behavior_keys = {"kick_left": "K", "kick_right": "L", "roulade": "R", "dance": "D"}
+    _behavior_keys = {"kick_left": "K", "kick_right": "L", "roulade": "R"}
     for _name in policy.behavior_sessions:
         print(f"{_name} policy: loaded  (press {_behavior_keys[_name]}, "
               f"auto-return after {policy.behavior_durations[_name]:.1f}s)")
@@ -1612,7 +1804,7 @@ def main():
             elif key == "r":
                 policy.trigger_behavior("roulade")
             elif key == "d":
-                policy.trigger_behavior("dance")
+                policy.trigger_dance()
             elif key == "q":
                 quit_requested = True
                 print("Quit requested")
@@ -1767,6 +1959,11 @@ def main():
 
                 policy.update_ground_pick_phase(actual_dt)
                 policy.update_behavior(actual_dt)
+                # The dance advances on the NOMINAL control step, not the
+                # measured wall-clock one: its phase is defined in simulated time,
+                # so a slow viewer would otherwise make the routine outrun the
+                # physics (see update_dance_phase).
+                policy.update_dance_phase(control_dt)
 
                 if policy_enabled:
                     action = policy.infer()
@@ -1858,6 +2055,9 @@ def main():
 
                 for _ in range(decimation):
                     if bam_ctrl is not None:
+                        # Feed the firmware loop the target delayed by the training
+                        # actuator's 3-6 substeps (see apply_substep_actuator_delay).
+                        policy.apply_substep_actuator_delay()
                         # BAM owns control/torque/friction: update() runs the
                         # firmware P-loop + DC-motor equation, writes the torque
                         # to data.ctrl and pushes the friction budget onto the
